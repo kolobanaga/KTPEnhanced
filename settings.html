@@ -1,7 +1,7 @@
-<div class="kimi_thinking_prefill_settings">
+<div class="ktp_enhanced_settings">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b>Kimi Thinking Prefill</b>
+            <b>KTPEnhanced</b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
 
@@ -9,7 +9,7 @@
             <small class="ktf-hint">
                 Client-side equivalent of the
                 <a href="https://rentry.org/kimi-k3-jb" target="_blank" rel="noopener">kimi-k3-jb server patch</a>:
-                injects a <code>reasoning_content</code> prefill for Kimi/Moonshot models.
+                injects a <code>reasoning_content</code> prefill for Kimi/Moonshot/GLM models, preserves prior reasoning across turns, and trims to context budget.
             </small>
 
             <div class="flex-container">
@@ -50,6 +50,17 @@
             </div>
             <small class="ktf-hint">
                 Requires "Show thoughts" to be on; prior reasoning is billed as input tokens.
+            </small>
+
+            <div class="flex-container">
+                <label class="flex-container">
+                    <input type="checkbox" id="ktf_trim_to_budget" checked>
+                    <small>Trim old chat messages when attached reasoning exceeds the context budget</small>
+                </label>
+            </div>
+            <small class="ktf-hint">
+                The core trims the history BEFORE reasoning is attached; this re-checks the budget after
+                and drops the oldest user/assistant turns to fit "Context Size" minus "Response (tokens)".
             </small>
 
             <div class="flex-container">

@@ -1,18 +1,18 @@
-.kimi_thinking_prefill_settings .ktf-hint {
+.ktp_enhanced_settings .ktf-hint {
     opacity: 0.8;
     display: block;
     margin: 0.4em 0;
 }
 
-.kimi_thinking_prefill_settings .flex-container {
+.ktp_enhanced_settings .flex-container {
     margin: 0.3em 0;
 }
 
-.kimi_thinking_prefill_settings textarea {
+.ktp_enhanced_settings textarea {
     resize: vertical;
 }
 
-.kimi_thinking_prefill_settings code {
+.ktp_enhanced_settings code {
     font-size: 0.9em;
     opacity: 0.9;
 }
