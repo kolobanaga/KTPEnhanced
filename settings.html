@@ -42,15 +42,37 @@
                 Required: with thinking disabled the model treats the prefill as reply text instead of reasoning.
             </small>
 
-            <div class="flex-container">
-                <label class="flex-container">
-                    <input type="checkbox" id="ktf_send_all_thinking">
-                    <small>Send all prior assistant reasoning back to the API</small>
-                </label>
+            <div class="flex-container flexFlowColumn">
+                <label for="ktf_reasoning_send_mode">Prior reasoning sent to the API</label>
+                <select id="ktf_reasoning_send_mode" class="text_pole">
+                    <option value="none">None</option>
+                    <option value="all">All</option>
+                    <option value="last">Last K</option>
+                    <option value="omit_older">Last K + Omitted</option>
+                </select>
+                <small>Re-attaches stored <code>extra.reasoning</code> to previous assistant messages. Only turns that actually have stored reasoning are affected — a non-reasoning model or a source that was not asked for reasoning simply has none to send.</small>
             </div>
-            <small class="ktf-hint">
-                Requires "Show thoughts" to be on; prior reasoning is billed as input tokens.
-            </small>
+
+            <div class="flex-container flexFlowColumn" id="ktf_reasoning_send_count_row">
+                <label for="ktf_reasoning_send_count">How many latest reasonings to send</label>
+                <input id="ktf_reasoning_send_count" class="text_pole" type="number" min="0" step="1" value="3" autocomplete="off">
+                <small>
+                    <code>Last K</code> sends reasoning for the newest K turns only;
+                    <code>Last K + Omitted</code> also keeps older turns, but replaces their reasoning
+                    with the placeholder below. Both spend far fewer input tokens
+                    and leave more room for actual chat history than <code>All</code>.
+                </small>
+            </div>
+
+            <div class="flex-container flexFlowColumn" id="ktf_reasoning_placeholder_row">
+                <label for="ktf_reasoning_placeholder">Placeholder for omitted reasoning</label>
+                <input id="ktf_reasoning_placeholder" class="text_pole" type="text" autocomplete="off" placeholder="[earlier thinking elided to fit the context window]">
+                <small>
+                    Sent as <code>reasoning_content</code> instead of the real reasoning of older turns,
+                    so the model still sees that thinking happened there. Left empty — nothing is sent
+                    for those turns.
+                </small>
+            </div>
 
             <div class="flex-container">
                 <label class="flex-container">
