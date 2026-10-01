@@ -13,6 +13,8 @@
 //      require prior reasoning to be passed back do not return a 400. Which
 //      messages are covered is chosen by the `reasoning_send_mode` strategy
 //      (none / all / last-k / last-k-with-placeholder) — see REASONING_MODE.
+//      The payload carries no message identifiers, so chat messages are paired
+//      with payload messages by their text (see attachPriorReasoning).
 //   3. Injection: if the last message is NOT an assistant message and the user
 //      has configured a reasoning prefill below, a trailing assistant message
 //      { role: 'assistant', content: '', reasoning_content: prefill, partial: true }
@@ -31,7 +33,7 @@
 // continue/impersonate/quiet generations.
 
 import { extension_settings } from '../../../extensions.js';
-import { saveSettingsDebounced } from '../../../../script.js';
+import { saveSettingsDebounced, substituteParams } from '../../../../script.js';
 import { countTokensOpenAIAsync } from '../../../tokenizers.js';
 
 const { eventSource, event_types } = SillyTavern.getContext();
@@ -175,6 +177,19 @@ function debugLog(...args) {
 }
 
 /**
+ * Shortens a message text for the debug log: the payload holds whole messages,
+ * so printing them in full is unreadable in the console. Newlines are collapsed
+ * so a pair can be compared by eye on a single line.
+ * @param {string} text Text to shorten
+ * @param {number} [length] How many characters to keep
+ * @returns {string} Single-line preview
+ */
+function preview(text, length = 32) {
+    const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
+    return flat.length > length ? `${flat.slice(0, length)}…` : flat;
+}
+
+/**
  * Thinking must be enabled for a reasoning_content prefill to work: with
  * thinking disabled the model continues the seeded field with reply text and
  * never reasons. Flips the request flag the server maps to
@@ -219,19 +234,63 @@ function applyThinkTransform(message) {
 }
 
 /**
+ * Builds the comparison key for a message text on either side of the matching.
+ *
+ * The core rewrites message text between the stored chat and the outgoing
+ * payload, so the raw `mes` and the payload `content` are not always the same
+ * string. Two of those rewrites are reproducible and are applied here so the
+ * two sides stay comparable:
+ *   - `{{macros}}`: preparePrompt() expands them for every chat message
+ *     (PromptManager.js:1282-1286 via openai.js:946). substituteParams() has no
+ *     fast path, so the `includes` guard keeps this free for the messages that
+ *     do not use macros.
+ *   - `\r`: stripped by setOpenAIMessages (openai.js:606).
+ *
+ * Not reproducible on purpose: `getRegexedString(..., { isPrompt: true })`
+ * (script.js:4447) rewrites the text of prompt-affecting regex scripts, and
+ * `appendFileContent` / appended titles (script.js:4448, 4461-4463) append to
+ * it. Their result depends on a `depth` the extension cannot reconstruct, so
+ * such messages simply fail to match and keep their reasoning back — a safe
+ * direction, since the alternative is reasoning attributed to the wrong turn.
+ * @param {string} text Message text from the chat or the payload
+ * @returns {string|null} Normalized key, or null for text that cannot match
+ */
+function matchKey(text) {
+    if (typeof text !== 'string') return null;
+    if (text.includes('{{')) {
+        try {
+            text = substituteParams(text);
+        } catch (error) {
+            console.warn(`[${extensionName}] Macro substitution failed while matching:`, error);
+        }
+    }
+    const key = text.replace(/\r/g, '').trim();
+    return key || null;
+}
+
+/**
  * Re-attaches stored reasoning (extra.reasoning) from past assistant chat
  * messages to the matching role:'assistant' entries in the outgoing messages
  * array. SillyTavern stores reasoning at chat[i].extra.reasoning but does not
  * forward it to the API on its own.
  *
- * Matching strategy: context trimming removes messages from the beginning of
- * the chat, so the END of the assistant message list is always aligned between
- * the full chat and the outgoing payload. We therefore pair messages starting
- * from the newest (last index) and walk backwards. This avoids the bug where
- * forward pairing would match trimmed-out early messages to later outgoing
- * messages. Messages flagged with the shared IGNORE_SYMBOL are excluded since
- * they are silently dropped by setOpenAIMessages and never appear in the
- * outgoing payload.
+ * Matching strategy: the payload carries no message identifiers — by the time
+ * the request is built every message has been rebuilt from role/content only
+ * (openai.js:3737-3752) — so the correspondence has to be recovered from the
+ * text itself. Both lists are walked from the newest end and a payload message
+ * is paired with the first chat message below the cursor whose key matches.
+ * The cursor only moves down and is NOT advanced by a payload message that
+ * matches nothing, so a message present in the payload but not in the chat (a
+ * preset prefill, a user injection, any number of them, anywhere) gets no
+ * reasoning and cannot shift the pairing of the other messages.
+ *
+ * Two things the core does on its own still have to be mirrored:
+ *   - On swipe the core drops the last chat message from the payload
+ *     (script.js:4438-4440), so it is skipped here as well. On regenerate the
+ *     core instead removes the message from the chat itself
+ *     (script.js:4346-4353), which is why no pop is needed for that type.
+ *   - Messages flagged with the shared IGNORE_SYMBOL never reach the payload
+ *     and are skipped so they cannot claim a payload message's text.
  *
  * How much of that reasoning is sent is the `reasoning_send_mode` strategy:
  * only the payloads are touched, the stored `extra.reasoning` in the chat is
@@ -248,34 +307,63 @@ function attachPriorReasoning(generateData) {
     if (!Array.isArray(chat)) return 0;
 
     const IGNORE_SYMBOL = Symbol.for('ignore');
-    const chatAssistantMsgs = chat.filter(m => m && !m.is_user && !m.is_system && !m.extra?.[IGNORE_SYMBOL]);
+    // Chat assistant messages, newest first (filter keeps the chat order, so
+    // reverse it before walking from the tail).
+    const chatAssistantMsgs = chat
+        .filter(m => m && !m.is_user && !m.is_system && !m.extra?.[IGNORE_SYMBOL])
+        .reverse();
 
-    // On swipe/regenerate the last assistant message in chat is the one being
-    // replaced — it is NOT present in the outgoing messages. If we kept it,
-    // reverse matching would shift every pairing by one (reasoning N onto
-    // outgoing N-1). Pop it so the tails stay aligned.
-    if (lastGenerationType === 'regenerate' || lastGenerationType === 'swipe') {
-        chatAssistantMsgs.pop();
+    if (lastGenerationType === 'swipe') {
+        chatAssistantMsgs.shift();
     }
+
+    // Only messages that actually stored reasoning can become a slot. The
+    // window strategies count THESE slots rather than plain assistant turns, so
+    // a stretch of turns without reasoning (e.g. a non-reasoning model, or a
+    // source that was not asked to return it) does not eat into the window.
+    const candidates = chatAssistantMsgs
+        .filter(m => typeof m.extra?.reasoning === 'string' && m.extra.reasoning.trim())
+        .map(m => ({ key: matchKey(m.mes), reason: m.extra.reasoning }));
+
+    // Duplicate keys are the one case where a payload message takes a
+    // candidate that belongs to a different turn. The newest payload message
+    // with a given text takes the newest candidate with that text, so every
+    // other payload message with the same text starves — and so does every
+    // candidate newer than the one that was taken. With an injection that copies
+    // an OLD turn's text and sits at the tail, the injection eats that old
+    // turn's reasoning and the newest turns are left with none, so the window K
+    // slides backwards onto old turns. The reasoning handed over always belongs
+    // to the same text, so this is a loss rather than a mix-up, but the window
+    // lands on the wrong turns — which is why the count is reported.
+    const keyCounts = new Map();
+    for (const candidate of candidates) {
+        if (candidate.key === null) continue;
+        keyCounts.set(candidate.key, (keyCounts.get(candidate.key) ?? 0) + 1);
+    }
+    const duplicateKeys = [...keyCounts.values()].reduce((n, count) => n + (count > 1 ? count - 1 : 0), 0);
 
     const outgoingAssistantMsgs = generateData.messages.filter(m => m && m.role === 'assistant');
 
-    // Collect the aligned pairs that actually carry stored reasoning. The
-    // window strategies count THESE slots rather than plain assistant turns,
-    // so a stretch of turns without reasoning (e.g. a non-reasoning model, or
-    // a source that was not asked to return it) does not silently eat into the
-    // window.
+    // Walk both lists from the newest end. A payload message that matches
+    // nothing is counted and skipped without moving the cursor.
     const slots = [];
-    const chatLen = chatAssistantMsgs.length;
-    const outLen = outgoingAssistantMsgs.length;
-    const count = Math.min(chatLen, outLen);
-    for (let i = 0; i < count; i++) {
-        const chatIdx = chatLen - 1 - i;
-        const outIdx = outLen - 1 - i;
-        const reason = chatAssistantMsgs[chatIdx]?.extra?.reasoning;
-        if (reason && typeof reason === 'string' && reason.trim() && !outgoingAssistantMsgs[outIdx].reasoning_content) {
-            slots.push({ message: outgoingAssistantMsgs[outIdx], reason });
+    const unmatchedTexts = [];
+    let cursor = 0;
+    let unmatched = 0;
+    for (let i = outgoingAssistantMsgs.length - 1; i >= 0; i--) {
+        const message = outgoingAssistantMsgs[i];
+        if (message.reasoning_content) continue;
+        const key = matchKey(message.content);
+        if (key === null) continue;
+        let j = cursor;
+        while (j < candidates.length && candidates[j].key !== key) j++;
+        if (j >= candidates.length) {
+            unmatched++;
+            unmatchedTexts.push(preview(key));
+            continue;
         }
+        slots.push({ message, reason: candidates[j].reason });
+        cursor = j + 1;
     }
     // Collected newest-first; flip so the window is a plain tail slice.
     slots.reverse();
@@ -311,8 +399,24 @@ function attachPriorReasoning(generateData) {
         // just a marker for the model, not something to continue.
         ensureThinkingEnabled(generateData);
     }
-    if (attached > 0 || stubbed > 0) {
-        debugLog(`Prior reasoning (${mode}): ${attached} sent in full, ${stubbed} replaced with placeholder, ${slots.length} reasoning slots total.`);
+    if (attached > 0 || stubbed > 0 || unmatched > 0) {
+        debugLog(`Prior reasoning (${mode}): ${attached} sent in full, ${stubbed} replaced with placeholder, ${slots.length} reasoning slots, ${unmatched} payload message(s) not matched to the chat, ${outgoingAssistantMsgs.length} assistant message(s) in payload, generation type "${lastGenerationType ?? 'unknown'}".`);
+        // The counts above cannot tell "paired the wrong way round" from "the
+        // chat data itself disagrees" — the message text and the reasoning
+        // stored next to it can simply not belong to each other (they are edited
+        // independently, and the core forwards extra.reasoning verbatim,
+        // openai.js:621), and then the extension faithfully sends that mismatch
+        // to the model. So the pairs themselves are logged: `candidates` is the
+        // chat side as it was seen, `matched` is what each payload message ended
+        // up with (real reasoning or placeholder), `unmatchedTexts` is what the
+        // payload had that no chat message could claim.
+        debugLog('Prior reasoning detail:', {
+            generationType: lastGenerationType ?? 'unknown',
+            duplicateKeys,
+            matched: slots.map(s => [preview(s.message.content), preview(s.message.reasoning_content)]),
+            unmatchedTexts,
+            candidates: candidates.map(c => [preview(c.key), preview(c.reason)]),
+        });
     }
     return attached;
 }
