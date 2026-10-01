@@ -158,7 +158,10 @@ function getSettings() {
     if (!REASONING_MODES.has(settings.reasoning_send_mode)) {
         settings.reasoning_send_mode = defaultSettings.reasoning_send_mode;
     }
-    if (!Number.isFinite(Number(settings.reasoning_send_count))) {
+    // Negative windows are meaningless — Math.max(0, …) at the use site would
+    // turn one into 0 anyway — so a hand-edited or stale value is repaired here.
+    // 0 is a legal choice (send no real reasoning at all) and is kept as-is.
+    if (!Number.isFinite(Number(settings.reasoning_send_count)) || Number(settings.reasoning_send_count) < 0) {
         settings.reasoning_send_count = DEFAULT_REASONING_COUNT;
     }
 
@@ -535,11 +538,30 @@ function bindSetting(selector, key, { isCheckbox = false, isNumber = false } = {
     } else {
         element.val(settings[key]);
     }
-    element.on('input change', function () {
-        const value = isCheckbox
-            ? Boolean($(this).prop('checked'))
-            : isNumber ? Number($(this).val()) : String($(this).val());
-        getSettings()[key] = value;
+    element.on('input change', function (event) {
+        if (isCheckbox) {
+            getSettings()[key] = Boolean($(this).prop('checked'));
+        } else if (isNumber) {
+            // Digits only. The field is a text input with a numeric keypad, so
+            // '-', 'e', '1.5' and other junk are stripped the moment they are
+            // typed or pasted and never reach the settings. A cleared field is
+            // not stored either — clearing it to retype K must not disable
+            // reasoning — and on change (blur or Enter) it snaps back to the
+            // value currently in effect. 0 stays a legal, storable choice.
+            const digits = String($(this).val()).replace(/\D/g, '');
+            if (digits !== String($(this).val())) {
+                $(this).val(digits);
+            }
+            if (digits === '') {
+                if (event.type === 'change') {
+                    $(this).val(getSettings()[key]);
+                }
+                return;
+            }
+            getSettings()[key] = Number(digits);
+        } else {
+            getSettings()[key] = String($(this).val());
+        }
         saveSettingsDebounced();
     });
 }

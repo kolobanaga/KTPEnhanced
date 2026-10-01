@@ -75,7 +75,7 @@ The windowed strategies are a deliberate trade-off, not a free win. Providers do
 Practical consequences for the strategies above:
 
 * `All` is the only contract-compliant option for `kimi-k3` and for GLM's Preserved Thinking. `Last K` is literally a truncation and `Last K + Omitted` is literally an edit, which is what those docs warn against.
-* The one hard failure mode is DeepSeek V4 (and MiMo): if the outgoing request carries a `tools` array, `reasoning_content` for every previous turn has to be present, so a windowed strategy can turn into a 400. Merely registering tools in a preset is enough to arm it — the model does not have to call them. Requests without `tools` are unaffected, and there the field is ignored rather than concatenated, so the window is free.
+* DeepSeek V4 (and MiMo) can return 400 when a request carries tools and a previous turn lost its `reasoning_content`. **This extension cannot trigger that**: the handler bails out before attaching anything whenever tools are in play. The check predates the strategies below and also covers tool messages and `tool_calls` already present in the history, not just a `tools` array in the request — so it is stricter than the documented DeepSeek rule. The price is that the strategies and the budget trimming are inert on tool requests too. Requests without tools are unaffected, and there DeepSeek ignores the field rather than concatenating it, so the window is free.
 * OpenRouter documents preserving reasoning for user-defined tools, but its server tools appear to work the other way round (previous history dropped). There is an explicit control for that — `reasoning.context: "current_turn"` versus `"all_turns"` — though OpenRouter lists it as supported only by OpenAI GPT-5.6 and newer, so it is not an available lever for the `reasoning_content` lineage this extension targets.
 * The economy argument inverts for models trained on preserved thinking — dropping reasoning can cost more tokens than it saves, because the model re-derives what it already concluded. A window is most defensible where the context is dominated by the chat itself rather than by reasoning continuity.
 * Field naming differs per provider (`reasoning_content`, `reasoning`, `reasoning_details[]`, inline `<think>`), and sending the wrong one can also be a hard 400 — e.g. GLM-4.7 on Cerebras rejects `reasoning_content` and expects `reasoning`.
@@ -87,6 +87,8 @@ Practical consequences for the strategies above:
 After attaching preserved reasoning, checks the estimated token usage again and removes the oldest user/assistant history messages until the request fits the configured context budget.
 
 Enabled by default.
+
+Note that this is skipped entirely on requests that involve tools: the handler returns before reasoning is attached, so neither the strategies nor this trimming run there. That guard is inherited from the original thinking-prefill patch and has never been relaxed.
 
 ### Thinking prefill
 

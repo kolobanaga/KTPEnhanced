@@ -55,12 +55,15 @@
 
             <div class="flex-container flexFlowColumn" id="ktf_reasoning_send_count_row">
                 <label for="ktf_reasoning_send_count">How many latest reasonings to send</label>
-                <input id="ktf_reasoning_send_count" class="text_pole" type="number" min="0" step="1" value="3" autocomplete="off">
+                <input id="ktf_reasoning_send_count" class="text_pole" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off">
                 <small>
                     <code>Last K</code> sends reasoning for the newest K turns only;
                     <code>Last K + Omitted</code> also keeps older turns, but replaces their reasoning
                     with the placeholder below. Both spend far fewer input tokens
                     and leave more room for actual chat history than <code>All</code>.
+                    <code>0</code> is allowed: no real reasoning is sent at all —
+                    <code>Last K</code> then forwards nothing, and
+                    <code>Last K + Omitted</code> puts the placeholder on every turn.
                 </small>
             </div>
 
