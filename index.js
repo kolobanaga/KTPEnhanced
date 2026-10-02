@@ -279,55 +279,40 @@ const PAIR_TOGETHER = 3;
 /**
  * Pairs payload assistant messages with the chat turns that stored reasoning.
  *
- * The payload carries no message identifiers — by the time the request is
- * built every message has been rebuilt from role/content only
- * (openai.js:3737-3752) — so the correspondence has to be recovered from the
- * text itself. What the core does to the payload between the chat and the
- * request (insertions, dropped/edited turns, order preserved) is exactly an
- * insertion/deletion edit of the chat sequence, so the correspondence is an
- * order-preserving common subsequence, i.e. an LCS. The score it maximises is
- * two-level and every level is a deliberate choice:
+ * The payload carries no message identifiers — by the time the request is built
+ * every message has been rebuilt from role/content only (openai.js:3737-3752) —
+ * so the correspondence is recovered from the text. What the core does between
+ * chat and request (insertions, dropped/edited turns, order preserved) is an
+ * insertion/deletion edit, so the correspondence is an order-preserving common
+ * subsequence, i.e. an LCS. Greedy is not an option: a payload message that is
+ * not a chat turn at all (preset prefill, user injection) can claim the newest
+ * candidate by text and starve everything above it.
  *
+ * The score is two-level, and both levels are load-bearing:
  *   1. the number of pairs (BIG per pair), then
- *   2. the sum of the matched payload positions (a bias, see below).
+ *   2. the sum of the matched payload positions.
+ * Level 2 is a sum, NOT a strictly lexicographic "rightmost" rule — chains at
+ * {2,3} and {1,4} score equal. When one candidate matches several identical
+ * payload messages, no text-based rule can tell which is the real turn, so it
+ * goes to the latest one; the reasoning belongs to that text either way.
  *
  * The window is NOT part of this objective — it is applied afterwards over the
- * pairs, and see the note on that below before changing the score.
+ * pairs (see attachPriorReasoning). Do not add it to the score: the total
+ * deliberately wins over the window, so a payload ending with an OLD turn's
+ * text (a tail injection of old text, or an old turn moved there) leaves that
+ * old turn unpaired instead of starving two newer turns — otherwise the
+ * reasoning lands on the oldest turn and the two newest, the ones the window
+ * exists for, get nothing.
  *
- * Why not walk both lists from the newest end and greedily take the first
- * match: that is order-preserving but not optimal, and a payload message that
- * is not a chat turn at all (a preset prefill, a user injection) can claim the
- * newest candidate with its text and starve everything above it. With an
- * injection copying an old turn's text at the tail, the walk gave the old
- * turn's reasoning to the injection and left the newest turns — the ones the
- * window exists for — with none. Maximising the pairing instead leaves the
- * injection unpaired and keeps the window on the newest turns.
+ * Both sequences are compared in natural oldest-first order; candidates arrive
+ * newest-first and are reversed here, and pairs come back oldest-first so the
+ * window is a plain tail slice.
  *
- * Ties — same number of pairs — are broken by the sum of the matched payload
- * positions, which biases the pairing towards the newest end. That is a sum,
- * not a strictly lexicographic "rightmost" rule: chains at {2,3} and {1,4}
- * score equal. The residue is the irreducible ambiguity, since a payload
- * message can only be paired with a candidate of the same text: when one
- * candidate matches several identical payload messages, no text-based rule can
- * tell which of them is the real turn, so it goes to the latest one — the
- * reasoning always belongs to the same text, only its position among equal
- * texts differs.
- *
- * Note that the window is applied AFTERWARDS and counts pairs, not payload
- * positions (see attachPriorReasoning). Maximising the number of pairs is what
- * makes the window land on the newest turns; the total deliberately wins over
- * the window, so a payload that ends with an OLD turn's text (a tail injection
- * of old text, or an old turn moved there) leaves that old turn unpaired
- * instead of starving two newer turns — see the worked example in AGENTS.md.
- *
- * Cost is O(n*m) time and memory over the number of pairable candidates and
- * payload messages; candidates whose text is not in the payload at all and
- * payload messages without text or with reasoning already set are dropped
- * first, and keys are interned to integers so the inner loop never compares
- * message bodies. The traceback is one byte per cell, so a chat of a few
- * thousand turns against a few hundred payload messages stays in the
- * megabytes; failures are contained by the caller's try/catch, which leaves the
- * payload untouched.
+ * Cost is O(n*m) time and memory. Messages with reasoning_content already set,
+ * and messages whose text no candidate holds, are dropped up front; keys are
+ * interned to integers so the inner loop never compares message bodies. The
+ * traceback is one byte per cell; failures are contained by the caller's
+ * try/catch, which leaves the payload untouched.
  * @param {Array<{key: string|null, reason: string}>} candidates Chat side, newest first
  * @param {Array<object>} messages Payload assistant messages, oldest first
  * @returns {{slots: Array<{message: object, reason: string}>, unmatched: Array<string>}}
