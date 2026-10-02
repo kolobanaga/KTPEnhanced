@@ -6,7 +6,7 @@
     "js": "index.js",
     "css": "style.css",
     "author": "kolobanaga",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "homePage": "https://github.com/kolobanaga/KTPEnhanced",
     "description": "SillyTavern extension for Kimi/GLM reasoning: preserves prior reasoning_content across turns, fixes reasoning alignment after context trimming, and optionally re-trims history to stay within the configured context budget. Client-side only; no SillyTavern server modifications.",
     "auto_update": true
