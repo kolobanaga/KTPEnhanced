@@ -13,8 +13,10 @@
 //      require prior reasoning to be passed back do not return a 400. Which
 //      messages are covered is chosen by the `reasoning_send_mode` strategy
 //      (none / all / last-k / last-k-with-placeholder) — see REASONING_MODE.
-//      The payload carries no message identifiers, so chat messages are paired
-//      with payload messages by their text (see attachPriorReasoning).
+//      The payload carries no message identifiers, so the correspondence is
+//      recovered from the text as the longest order-preserving pairing of
+//      payload messages with the chat turns that stored reasoning
+//      (see pairWithCandidates).
 //   3. Injection: if the last message is NOT an assistant message and the user
 //      has configured a reasoning prefill below, a trailing assistant message
 //      { role: 'assistant', content: '', reasoning_content: prefill, partial: true }
@@ -268,6 +270,184 @@ function matchKey(text) {
     return key || null;
 }
 
+// The three steps of the pairing DP, written into the traceback as bytes: leave
+// the candidate unpaired, leave the payload message unpaired, or pair them.
+const PAIR_SKIP_CANDIDATE = 1;
+const PAIR_SKIP_MESSAGE = 2;
+const PAIR_TOGETHER = 3;
+
+/**
+ * Pairs payload assistant messages with the chat turns that stored reasoning.
+ *
+ * The payload carries no message identifiers — by the time the request is
+ * built every message has been rebuilt from role/content only
+ * (openai.js:3737-3752) — so the correspondence has to be recovered from the
+ * text itself. What the core does to the payload between the chat and the
+ * request (insertions, dropped/edited turns, order preserved) is exactly an
+ * insertion/deletion edit of the chat sequence, so the correspondence is an
+ * order-preserving common subsequence, i.e. an LCS. The score it maximises is
+ * two-level and every level is a deliberate choice:
+ *
+ *   1. the number of pairs (BIG per pair), then
+ *   2. the sum of the matched payload positions (a bias, see below).
+ *
+ * The window is NOT part of this objective — it is applied afterwards over the
+ * pairs, and see the note on that below before changing the score.
+ *
+ * Why not walk both lists from the newest end and greedily take the first
+ * match: that is order-preserving but not optimal, and a payload message that
+ * is not a chat turn at all (a preset prefill, a user injection) can claim the
+ * newest candidate with its text and starve everything above it. With an
+ * injection copying an old turn's text at the tail, the walk gave the old
+ * turn's reasoning to the injection and left the newest turns — the ones the
+ * window exists for — with none. Maximising the pairing instead leaves the
+ * injection unpaired and keeps the window on the newest turns.
+ *
+ * Ties — same number of pairs — are broken by the sum of the matched payload
+ * positions, which biases the pairing towards the newest end. That is a sum,
+ * not a strictly lexicographic "rightmost" rule: chains at {2,3} and {1,4}
+ * score equal. The residue is the irreducible ambiguity, since a payload
+ * message can only be paired with a candidate of the same text: when one
+ * candidate matches several identical payload messages, no text-based rule can
+ * tell which of them is the real turn, so it goes to the latest one — the
+ * reasoning always belongs to the same text, only its position among equal
+ * texts differs.
+ *
+ * Note that the window is applied AFTERWARDS and counts pairs, not payload
+ * positions (see attachPriorReasoning). Maximising the number of pairs is what
+ * makes the window land on the newest turns; the total deliberately wins over
+ * the window, so a payload that ends with an OLD turn's text (a tail injection
+ * of old text, or an old turn moved there) leaves that old turn unpaired
+ * instead of starving two newer turns — see the worked example in AGENTS.md.
+ *
+ * Cost is O(n*m) time and memory over the number of pairable candidates and
+ * payload messages; candidates whose text is not in the payload at all and
+ * payload messages without text or with reasoning already set are dropped
+ * first, and keys are interned to integers so the inner loop never compares
+ * message bodies. The traceback is one byte per cell, so a chat of a few
+ * thousand turns against a few hundred payload messages stays in the
+ * megabytes; failures are contained by the caller's try/catch, which leaves the
+ * payload untouched.
+ * @param {Array<{key: string|null, reason: string}>} candidates Chat side, newest first
+ * @param {Array<object>} messages Payload assistant messages, oldest first
+ * @returns {{slots: Array<{message: object, reason: string}>, unmatched: Array<string>}}
+ * Pairing oldest-first (a plain tail slice for the window) plus the payload
+ * texts that no candidate could claim, oldest-first as well.
+ */
+function pairWithCandidates(candidates, messages) {
+    const textKeys = [];
+    const pairable = [];
+    for (const message of messages) {
+        // Text the core or a previous step already filled keeps what it has.
+        if (!message || message.reasoning_content) continue;
+        const key = matchKey(message.content);
+        if (key === null) continue;
+        textKeys.push(key);
+        pairable.push(message);
+    }
+
+    const wanted = new Set(textKeys);
+    // Both sequences are compared in their natural (oldest first) order, which
+    // is what makes the pairing order-preserving.
+    const chatOldestFirst = candidates.filter(c => c.key !== null && wanted.has(c.key)).reverse();
+    const candidateCount = chatOldestFirst.length;
+    const messageCount = textKeys.length;
+
+    const slots = [];
+    const paired = new Uint8Array(messageCount);
+    const collectUnmatched = () => {
+        const texts = [];
+        for (let j = 0; j < messageCount; j++) {
+            if (!paired[j]) texts.push(textKeys[j]);
+        }
+        return texts;
+    };
+    if (!candidateCount || !messageCount) {
+        return { slots, unmatched: collectUnmatched() };
+    }
+
+    // Score of a pair placed at payload index j: BIG makes the number of pairs
+    // dominate the tie-break term, so the best score always is a longest
+    // pairing, and the sum of the positions breaks ties towards the newest end.
+    const BIG = (messageCount * (messageCount + 1)) / 2 + 1;
+    const width = messageCount + 1;
+    const traceback = new Uint8Array((candidateCount + 1) * width);
+    let previousRow = new Float64Array(width);
+    let currentRow = new Float64Array(width);
+
+    // The inner loop compares every candidate against every payload message,
+    // and chat texts run into thousands of characters, so the keys are
+    // interned to integers once: the compare becomes an integer compare and
+    // long texts stop costing character-by-character comparisons.
+    const keyIds = new Map();
+    const idOf = key => {
+        let id = keyIds.get(key);
+        if (id === undefined) {
+            id = keyIds.size;
+            keyIds.set(key, id);
+        }
+        return id;
+    };
+    const messageKeyIds = textKeys.map(idOf);
+    const candidateKeyIds = chatOldestFirst.map(c => idOf(c.key));
+
+    for (let i = 1; i <= candidateCount; i++) {
+        const key = candidateKeyIds[i - 1];
+        const rowOffset = i * width;
+        for (let j = 1; j <= messageCount; j++) {
+            // Leave the candidate unpaired: its turn was edited, dropped or
+            // shadowed by an injection that won the text.
+            let best = previousRow[j];
+            let step = PAIR_SKIP_CANDIDATE;
+            // Leave the payload message unpaired: an injection or a duplicate
+            // that no candidate could take without breaking the order.
+            if (currentRow[j - 1] > best) {
+                best = currentRow[j - 1];
+                step = PAIR_SKIP_MESSAGE;
+            }
+            if (key === messageKeyIds[j - 1]) {
+                const together = previousRow[j - 1] + BIG + (j - 1);
+                if (together >= best) {
+                    best = together;
+                    step = PAIR_TOGETHER;
+                }
+            }
+            currentRow[j] = best;
+            traceback[rowOffset + j] = step;
+        }
+        const swap = previousRow;
+        previousRow = currentRow;
+        currentRow = swap;
+    }
+
+    const pairs = [];
+    let i = candidateCount;
+    let j = messageCount;
+    while (i > 0 && j > 0) {
+        const step = traceback[i * width + j];
+        if (step === PAIR_TOGETHER) {
+            pairs.push([i - 1, j - 1]);
+            i--;
+            j--;
+        } else if (step === PAIR_SKIP_CANDIDATE) {
+            i--;
+        } else {
+            j--;
+        }
+    }
+    // Collected newest-first; flip so the window is a plain tail slice.
+    pairs.reverse();
+    for (const [candidateIndex, messageIndex] of pairs) {
+        paired[messageIndex] = 1;
+        slots.push({
+            message: pairable[messageIndex],
+            reason: chatOldestFirst[candidateIndex].reason,
+        });
+    }
+
+    return { slots, unmatched: collectUnmatched() };
+}
+
 /**
  * Re-attaches stored reasoning (extra.reasoning) from past assistant chat
  * messages to the matching role:'assistant' entries in the outgoing messages
@@ -277,12 +457,9 @@ function matchKey(text) {
  * Matching strategy: the payload carries no message identifiers — by the time
  * the request is built every message has been rebuilt from role/content only
  * (openai.js:3737-3752) — so the correspondence has to be recovered from the
- * text itself. Both lists are walked from the newest end and a payload message
- * is paired with the first chat message below the cursor whose key matches.
- * The cursor only moves down and is NOT advanced by a payload message that
- * matches nothing, so a message present in the payload but not in the chat (a
- * preset prefill, a user injection, any number of them, anywhere) gets no
- * reasoning and cannot shift the pairing of the other messages.
+ * text itself, and it is recovered as the longest order-preserving pairing of
+ * payload messages with chat turns that stored reasoning (see
+ * pairWithCandidates).
  *
  * Two things the core does on its own still have to be mirrored:
  *   - On swipe the core drops the last chat message from the payload
@@ -307,8 +484,10 @@ function attachPriorReasoning(generateData) {
     if (!Array.isArray(chat)) return 0;
 
     const IGNORE_SYMBOL = Symbol.for('ignore');
-    // Chat assistant messages, newest first (filter keeps the chat order, so
-    // reverse it before walking from the tail).
+    // Chat assistant messages, newest first. filter() keeps the chat order, so
+    // the reverse() is what makes index 0 the newest turn — which the swipe
+    // shift() below relies on, and which pairWithCandidates undoes internally
+    // to compare both sequences in their natural order.
     const chatAssistantMsgs = chat
         .filter(m => m && !m.is_user && !m.is_system && !m.extra?.[IGNORE_SYMBOL])
         .reverse();
@@ -325,16 +504,12 @@ function attachPriorReasoning(generateData) {
         .filter(m => typeof m.extra?.reasoning === 'string' && m.extra.reasoning.trim())
         .map(m => ({ key: matchKey(m.mes), reason: m.extra.reasoning }));
 
-    // Duplicate keys are the one case where a payload message takes a
-    // candidate that belongs to a different turn. The newest payload message
-    // with a given text takes the newest candidate with that text, so every
-    // other payload message with the same text starves — and so does every
-    // candidate newer than the one that was taken. With an injection that copies
-    // an OLD turn's text and sits at the tail, the injection eats that old
-    // turn's reasoning and the newest turns are left with none, so the window K
-    // slides backwards onto old turns. The reasoning handed over always belongs
-    // to the same text, so this is a loss rather than a mix-up, but the window
-    // lands on the wrong turns — which is why the count is reported.
+    // Duplicate keys are the one case the text alone cannot resolve: two turns
+    // (or an injection copying a turn) share a text, so only one of the payload
+    // messages carrying it can be paired and the rest stay without reasoning.
+    // The pairing always gives it to the latest one and the reasoning always
+    // belongs to that text, so this is a loss of coverage rather than a mix-up —
+    // reported because it is the only expected source of `unmatched` growth.
     const keyCounts = new Map();
     for (const candidate of candidates) {
         if (candidate.key === null) continue;
@@ -344,29 +519,15 @@ function attachPriorReasoning(generateData) {
 
     const outgoingAssistantMsgs = generateData.messages.filter(m => m && m.role === 'assistant');
 
-    // Walk both lists from the newest end. A payload message that matches
-    // nothing is counted and skipped without moving the cursor.
-    const slots = [];
-    const unmatchedTexts = [];
-    let cursor = 0;
-    let unmatched = 0;
-    for (let i = outgoingAssistantMsgs.length - 1; i >= 0; i--) {
-        const message = outgoingAssistantMsgs[i];
-        if (message.reasoning_content) continue;
-        const key = matchKey(message.content);
-        if (key === null) continue;
-        let j = cursor;
-        while (j < candidates.length && candidates[j].key !== key) j++;
-        if (j >= candidates.length) {
-            unmatched++;
-            unmatchedTexts.push(preview(key));
-            continue;
-        }
-        slots.push({ message, reason: candidates[j].reason });
-        cursor = j + 1;
-    }
-    // Collected newest-first; flip so the window is a plain tail slice.
-    slots.reverse();
+    // Longest order-preserving pairing of payload messages with chat turns.
+    // Everything the payload holds but the chat does not (a preset prefill, a
+    // user injection, an edited turn) is left unpaired and reported.
+    // Timed because it is the only quadratic step in the hook, and the sizes
+    // travel with it: what matters for the cost is candidates x payload
+    // messages, not the chat length on its own.
+    const pairingStarted = performance.now();
+    const { slots, unmatched } = pairWithCandidates(candidates, outgoingAssistantMsgs);
+    const pairingMs = ms(performance.now() - pairingStarted);
 
     // Index of the first slot that stays verbatim; everything before it is
     // either dropped (LAST) or replaced by the placeholder (OMIT_OLDER).
@@ -399,8 +560,8 @@ function attachPriorReasoning(generateData) {
         // just a marker for the model, not something to continue.
         ensureThinkingEnabled(generateData);
     }
-    if (attached > 0 || stubbed > 0 || unmatched > 0) {
-        debugLog(`Prior reasoning (${mode}): ${attached} sent in full, ${stubbed} replaced with placeholder, ${slots.length} reasoning slots, ${unmatched} payload message(s) not matched to the chat, ${outgoingAssistantMsgs.length} assistant message(s) in payload, generation type "${lastGenerationType ?? 'unknown'}".`);
+    if (attached > 0 || stubbed > 0 || unmatched.length > 0) {
+        debugLog(`Prior reasoning (${mode}): ${attached} sent in full, ${stubbed} replaced with placeholder, ${slots.length} reasoning slots, ${unmatched.length} payload message(s) not paired with the chat, ${outgoingAssistantMsgs.length} assistant message(s) in payload, generation type "${lastGenerationType ?? 'unknown'}".`);
         // The counts above cannot tell "paired the wrong way round" from "the
         // chat data itself disagrees" — the message text and the reasoning
         // stored next to it can simply not belong to each other (they are edited
@@ -409,16 +570,36 @@ function attachPriorReasoning(generateData) {
         // to the model. So the pairs themselves are logged: `candidates` is the
         // chat side as it was seen, `matched` is what each payload message ended
         // up with (real reasoning or placeholder), `unmatchedTexts` is what the
-        // payload had that no chat message could claim.
+        // payload had that no chat message could claim. `matched` and
+        // `unmatchedTexts` are both in payload order, oldest first.
         debugLog('Prior reasoning detail:', {
             generationType: lastGenerationType ?? 'unknown',
             duplicateKeys,
+            // Cost of the pairing itself, and the size it ran on. Quadratic in
+            // the product, so a long chat is only expensive if many of its
+            // turns also made it into this request.
+            pairingMs,
+            pairingSize: `${candidates.length} candidate(s) x ${outgoingAssistantMsgs.length} payload message(s)`,
             matched: slots.map(s => [preview(s.message.content), preview(s.message.reasoning_content)]),
-            unmatchedTexts,
+            // Wrapped, not passed as a bare reference: map() also passes the
+            // index, which would land in preview()'s `length` parameter and
+            // truncate the first entries to nothing.
+            unmatchedTexts: unmatched.map(text => preview(text)),
             candidates: candidates.map(c => [preview(c.key), preview(c.reason)]),
         });
     }
     return attached;
+}
+
+/**
+ * Rounds a millisecond reading for the debug log. Raw `performance.now()`
+ * differences carry sub-microsecond noise that only makes the numbers harder to
+ * compare between requests.
+ * @param {number} value Milliseconds
+ * @returns {number} Same value, one decimal
+ */
+function ms(value) {
+    return Math.round(value * 10) / 10;
 }
 
 /**
@@ -428,19 +609,22 @@ function attachPriorReasoning(generateData) {
  * is priced separately by counting a synthetic message whose content IS the
  * reasoning text. Caches in the core token cache make repeated counts cheap.
  * @param {object} message Outgoing payload message
- * @returns {Promise<number>} Estimated token cost including reasoning_content
+ * @returns {Promise<{tokens: number, calls: number}>} Estimated token cost
+ * including reasoning_content, and how many tokenizer calls it took — two for a
+ * message that carries reasoning, one otherwise. Reported because this is the
+ * dominant cost of trimToBudget and the only part that is not pure arithmetic.
  */
 async function countMessageTokens(message) {
     const base = await countTokensOpenAIAsync(message, true);
     const reasoning = typeof message?.reasoning_content === 'string' ? message.reasoning_content.trim() : '';
     if (!reasoning) {
-        return base;
+        return { tokens: base, calls: 1 };
     }
     // Price the reasoning as a standalone assistant message (includes the
     // message framing overhead, i.e. a pessimistic upper bound). Cache hash
     // colliding with a real message is harmless: the cost is identical anyway.
     const reasoningTokens = await countTokensOpenAIAsync({ role: message.role || 'assistant', content: reasoning }, true);
-    return base + reasoningTokens;
+    return { tokens: base + reasoningTokens, calls: 2 };
 }
 
 /**
@@ -452,14 +636,19 @@ async function countMessageTokens(message) {
  * canAfford in populateChatHistory effectively discards the history head).
  *
  * Droppable = user/assistant chat history messages, excluding the trailing
- * trailing message (prefill/continue target). System/preset prompts (char
- * card, world info, nudges) are pinned — the core treats them as mandatory
- * budget, never dropping them either.
+ * message (prefill/continue target). System/preset prompts (char card, world
+ * info, nudges) are pinned — the core treats them as mandatory budget, never
+ * dropping them either.
+ *
+ * Cost note: the token count is the only part that is not arithmetic, so the
+ * debug log reports how long it took and how many tokenizer calls it needed —
+ * that is the number to watch if the hook ever feels slow.
  * @param {object} generateData Outgoing request payload
  */
 async function trimToBudget(generateData) {
     const settings = getSettings();
     if (!settings.trim_to_budget) return;
+    const trimStarted = performance.now();
 
     const oai = SillyTavern.getContext().chatCompletionSettings;
     const maxContext = Number(oai?.openai_max_context);
@@ -473,13 +662,20 @@ async function trimToBudget(generateData) {
     const budget = maxContext - maxTokens - 3;
     const messages = generateData.messages;
 
+    // Tokenizing is the only part of this function that is not arithmetic, so
+    // it is timed and counted separately: if the core token cache misses, this
+    // is where the latency of the whole hook comes from.
+    const countStarted = performance.now();
     const messageTokens = [];
     let totalTokens = 0;
+    let tokenizerCalls = 0;
     for (const message of messages) {
-        const tokens = await countMessageTokens(message);
+        const { tokens, calls } = await countMessageTokens(message);
         messageTokens.push(tokens);
+        tokenizerCalls += calls;
         totalTokens += tokens;
     }
+    const countMs = ms(performance.now() - countStarted);
 
     const incomingCount = messages.length;
     const baseSummary = {
@@ -489,10 +685,15 @@ async function trimToBudget(generateData) {
         messageCount: incomingCount,
         totalTokens,
         overage: totalTokens - budget,
+        tokenizerCalls,
+        countMs,
     };
 
     if (totalTokens <= budget) {
-        debugLog('Trim: payload fits the budget after reasoning attach, nothing to trim.', baseSummary);
+        debugLog('Trim: payload fits the budget after reasoning attach, nothing to trim.', {
+            ...baseSummary,
+            trimMs: ms(performance.now() - trimStarted),
+        });
         return;
     }
 
@@ -532,6 +733,9 @@ async function trimToBudget(generateData) {
         totalTokensAfter: totalTokens,
         fitsBudget: totalTokens <= budget,
         remainingMessages: messages.length,
+        // Total, tokenizer included. Compare against countMs to see how much of
+        // it the tokenizer took.
+        trimMs: ms(performance.now() - trimStarted),
     });
 }
 
