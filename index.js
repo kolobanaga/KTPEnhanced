@@ -5,9 +5,11 @@
 // request payload before it leaves the browser:
 //
 //   1. Patch parity: if the last message is an assistant message whose content
-//      starts with a leading think block (see THINK_REGEX), the block is moved
-//      into `reasoning_content` and the message is flagged `partial: true`
-//      (identical transform to the patched addAssistantPrefix).
+//      starts with a leading reasoning block (see getReasoningTemplate), the
+//      block is moved into `reasoning_content` and the message is flagged
+//      `partial: true` (identical transform to the patched addAssistantPrefix).
+//      The block markers are read from the core's "Reasoning Formatting"
+//      template, so any template works, not just the <think> default.
 //   2. Re-attach: re-populates `reasoning_content` on prior assistant messages
 //      from the stored `extra.reasoning` chat field, so providers that
 //      require prior reasoning to be passed back do not return a 400. Which
@@ -31,14 +33,16 @@
 //      System/preset prompts and the trailing message are pinned.
 //
 // Guards (mirroring the patch): skipped when json_schema is active, when tools
-// are in play, when the model doesn't match the filter, and for
-// continue/impersonate/quiet generations.
+// are in play, and when the model doesn't match the filter. Generation type
+// gates the two features separately: the transform covers 'continue' as well
+// (TRANSFORM_TYPES), the injection does not (INJECT_TYPES).
 
 import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, substituteParams } from '../../../../script.js';
 import { countTokensOpenAIAsync } from '../../../tokenizers.js';
+import { escapeRegex } from '../../../utils.js';
 
-const { eventSource, event_types } = SillyTavern.getContext();
+const { eventSource, event_types, powerUserSettings } = SillyTavern.getContext();
 
 const extensionName = 'KTPEnhanced';
 const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
@@ -118,9 +122,6 @@ const defaultSettings = {
     // compensate (mirrors the reverse-iteration trimming of populateChatHistory).
     trim_to_budget: true,
 };
-
-// Same regex as the patched prompt-converters.js addAssistantPrefix().
-const THINK_REGEX = /^\s*<think>(.*?)(<\/think>|$)/s;
 
 // Generation types the prefill applies to. 'continue' ends on an assistant
 // message (the patch transform still applies there), 'quiet'/'impersonate'
@@ -215,8 +216,46 @@ function matchesModelFilter(model) {
 }
 
 /**
- * Patch-parity transform: move a leading <think> block of a trailing assistant
- * message into reasoning_content and flag it partial.
+ * Markers of the reasoning template the core wraps prior (and Continue) target
+ * reasoning in, i.e. the user's "Reasoning Formatting" choice.
+ *
+ * The core builds that wrapper itself: PromptReasoning.addToMessage() returns
+ * `prefix + reasoning + suffix + separator + content` (reasoning.js:751), and
+ * it is called for the trailing message with `isPrefix = true` when the
+ * generation type is 'continue' (script.js:4475, 4484). So the markers in the
+ * payload are whatever the template says, and hardcoding `<think>` only ever
+ * worked by coincidence: the default template is `<think>`/`</think>`
+ * (power-user.js:280), which is also what DeepSeek-style templates use, while
+ * every other template (OpenAI Harmony, a custom one) failed to match at all.
+ *
+ * Both markers are required. An empty prefix or suffix means the template
+ * wraps nothing, so there is no block to pull out — and an empty suffix would
+ * additionally make the regex match at zero width and swallow the message.
+ * Macros are expanded into the markers before they reach the payload
+ * (addToMessage substitutes them), so the markers to match against are the
+ * expanded ones.
+ * @returns {{prefix: string, suffix: string, separator: string, name: string}|null}
+ * Effective template, or null when the template wraps no reasoning block
+ */
+function getReasoningTemplate() {
+    const reasoning = powerUserSettings?.reasoning;
+    const prefix = String(reasoning?.prefix ?? '');
+    const suffix = String(reasoning?.suffix ?? '');
+    if (!prefix || !suffix) {
+        return null;
+    }
+    return {
+        prefix: substituteParams(prefix),
+        suffix: substituteParams(suffix),
+        separator: substituteParams(String(reasoning?.separator ?? '')),
+        name: String(reasoning?.name ?? ''),
+    };
+}
+
+/**
+ * Patch-parity transform: move a leading reasoning block of a trailing
+ * assistant message into reasoning_content and flag it partial. Template-driven
+ * — see getReasoningTemplate() for why the markers are not hardcoded.
  * @param {object} message Last chat message
  * @returns {boolean} Whether a transform was applied
  */
@@ -224,14 +263,33 @@ function applyThinkTransform(message) {
     if (!message || message.role !== 'assistant' || typeof message.content !== 'string') {
         return false;
     }
-    const match = message.content.match(THINK_REGEX);
+    const template = getReasoningTemplate();
+    if (!template) {
+        return false;
+    }
+    // The suffix branch matches an unfinished block: pressing Continue while the
+    // model is still reasoning leaves the message as `prefix + reasoning` with
+    // no suffix and no content (addToMessage's incomplete branch).
+    const regex = new RegExp(`^\\s*?${escapeRegex(template.prefix)}(.*?)(?:${escapeRegex(template.suffix)}|$)`, 's');
+    const match = message.content.match(regex);
     if (!match) {
         return false;
     }
+    let content = message.content.replace(regex, '');
+    // A finished block is followed by the template separator, which is
+    // formatting rather than content, so it is cut BEFORE trimming. Trimming
+    // first eats a separator that begins with whitespace ('\n\n', '\n333\n')
+    // and the match below then fails, leaving the separator's visible part at
+    // the start of the assistant text. Nothing upstream strips it — the core
+    // only drops '\r' (openai.js:606) and Message.createAsync() stores the
+    // content as is — so the remainder here is exactly separator + content.
+    if (template.separator && content.startsWith(template.separator)) {
+        content = content.slice(template.separator.length);
+    }
     message.reasoning_content = match[1].trim();
-    message.content = message.content.replace(THINK_REGEX, '').trimStart();
+    message.content = content.trimStart();
     message.partial = true;
-    debugLog('Transformed trailing assistant <think> block into reasoning_content:', message.reasoning_content);
+    debugLog(`Transformed trailing assistant reasoning block (template "${template.name}") into reasoning_content:`, message.reasoning_content);
     return true;
 }
 
@@ -629,8 +687,11 @@ async function countMessageTokens(message) {
  * debug log reports how long it took and how many tokenizer calls it needed —
  * that is the number to watch if the hook ever feels slow.
  * @param {object} generateData Outgoing request payload
+ * @param {object} [protectedTarget] Message that must survive trimming whatever
+ * its position — the Continue target, which ST's default Continue nudge pushes
+ * off the end of the payload
  */
-async function trimToBudget(generateData) {
+async function trimToBudget(generateData, protectedTarget = null) {
     const settings = getSettings();
     if (!settings.trim_to_budget) return;
     const trimStarted = performance.now();
@@ -682,10 +743,24 @@ async function trimToBudget(generateData) {
         return;
     }
 
-    // Never drop the trailing message (prefill/continue target/last user turn).
-    // Protected = indexes of the last message only; everything else is
-    // eligible for trimming oldest-first.
-    let protectedIndex = messages.length - 1;
+    // Never drop the trailing message (prefill/last user turn/continue nudge),
+    // and never drop the Continue target either.
+    //
+    // The target needs its own protection *because* of the nudge: with ST's
+    // default Continue behaviour the core appends the nudge system message
+    // after the assistant message being continued (openai.js:1079-1082), so the
+    // target stops being the last message — and an assistant message in that
+    // position is trimmable. Dropping it would leave the request ending in a
+    // nudge with no text to continue.
+    //
+    // Protected by object identity rather than by index: the loop splices the
+    // array, which would require re-numbering every protected index on each
+    // removal. The nudge is skipped anyway by the role filter below, so what is
+    // really at stake here is the target.
+    const protectedMessages = new Set([messages.at(-1)]);
+    if (protectedTarget) {
+        protectedMessages.add(protectedTarget);
+    }
 
     let removed = 0;
     let removedTokens = 0;
@@ -693,7 +768,7 @@ async function trimToBudget(generateData) {
     for (let i = 0; i < messages.length && totalTokens > budget; i++) {
         const message = messages[i];
         if (!message) continue;
-        if (i === protectedIndex) continue;
+        if (protectedMessages.has(message)) continue;
         // Pinned: system/developer prompts and tool messages are mandatory in
         // the core budget as well; only chat-history turns are trimmable.
         if (!['user', 'assistant'].includes(message.role)) continue;
@@ -701,7 +776,6 @@ async function trimToBudget(generateData) {
         const tokens = messageTokens[i];
         messages.splice(i, 1);
         messageTokens.splice(i, 1);
-        if (protectedIndex > i) protectedIndex--;
 
         totalTokens -= tokens;
         removed++;
@@ -770,25 +844,61 @@ async function onChatCompletionSettingsReady(generateData) {
         // message transform/injection so the prefill is never double-assigned.
         attachPriorReasoning(generateData);
 
-        // Prefill features (transform + injection) are gated separately.
+        const type = lastGenerationType;
+        const last = messages.at(-1);
+
+        // Which message the transform looks at.
+        //
+        // On 'continue' the core does NOT leave the target as the last message:
+        // it moves it into a collection that is appended last, together with a
+        // `continue_nudge_prompt` system message (openai.js:1079-1082, built at
+        // 898-918 from the last non-injected chat message). So the payload ends
+        // with [..., assistantTarget, systemNudge] and `last` is that nudge.
+        // The target is therefore the last assistant message.
+        //
+        // Scoped to 'continue' on purpose. For the other types the trailing
+        // assistant message is a preset prefill and must be matched exactly, and
+        // a *prior* assistant message can legitimately start with the template
+        // prefix as well — with "Add reasoning to prompts" on, addToMessage()
+        // wraps those too (reasoning.js:718-720) — so scanning back for any
+        // generation type would let the transform rewrite a turn that has no
+        // business being rewritten.
+        //
+        // A wrong pick cannot do damage anyway: applyThinkTransform() only acts
+        // on a message that actually starts with the template prefix.
+        const target = type === 'continue'
+            ? messages.findLast(message => message?.role === 'assistant')
+            : last;
+
+        // A trailing assistant message is a preset prefill or a Continue target,
+        // and either way this branch ends the handler: there is nothing to inject
+        // after it.
+        //
+        // The transform is patch parity, not a prefill feature, so it is NOT
+        // gated on prefill_enabled (only the injection below is). At this point a
+        // Continue target still carries its reasoning inline, inside the core's
+        // template wrapper, and leaving it there is exactly the bug the transform
+        // exists to fix — with reasoning and text in one channel the extension
+        // has nothing to do.
+        //
+        // Order matters: the transform strips the reasoning out of the message
+        // text, so running it before attachPriorReasoning() would let the
+        // Continue target claim a candidate by its now-plain content and pick up
+        // that turn's STALE stored reasoning instead of its own fresh one.
+        if (target && target.role === 'assistant') {
+            if (TRANSFORM_TYPES.has(type) && applyThinkTransform(target)) {
+                ensureThinkingEnabled(generateData);
+            }
+            await trimToBudget(generateData, target);
+            return;
+        }
+
+        // Prefill injection (below) is gated separately.
         if (!settings.prefill_enabled) {
             await trimToBudget(generateData);
             return;
         }
 
-        const type = lastGenerationType;
-        const last = messages.at(-1);
-
-        if (last && last.role === 'assistant') {
-            // Trailing assistant message (preset prefill or a Continue target).
-            if (TRANSFORM_TYPES.has(type) && applyThinkTransform(last)) {
-                ensureThinkingEnabled(generateData);
-            }
-            await trimToBudget(generateData);
-            return;
-        }
-
-        // No trailing assistant message: inject the configured reasoning prefill.
         const prefill = String(settings.reasoning_prefill ?? '').trim();
         if (!prefill) {
             debugLog('Skipped: no reasoning prefill configured.');
