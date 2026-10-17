@@ -4,11 +4,62 @@ A SillyTavern extension for Kimi/GLM models that enables client-side handling of
 
 This is a fork of [Rurijian/KimiThinkingPrefill](https://github.com/Rurijian/KimiThinkingPrefill), with additional fixes for preserved reasoning and context-budget handling.
 
+## What is Preserved Thinking / Multi-turn Reasoning?
+
+Different labs and providers use different names for closely related behaviour, including **Preserved Thinking**, **Multi-turn Reasoning**, **Interleaved Thinking**, **Reasoning Persistence**, and **CoT Persistence**. The exact API contract varies by provider, but the shared idea is that a model's reasoning is carried forward from one turn to the next instead of being discarded after each response.
+
+In a typical chat-completion request, the conversation contains alternating user messages and assistant messages. An assistant message may have both a user-facing answer (`content`) and a separate reasoning field (`reasoning_content`). For multi-turn reasoning, the client sends the previous assistant reasoning back as part of the conversation history, alongside the corresponding answer:
+
+```js
+{
+  messages: [
+    { role: 'user', content: 'Turn 1.' },
+    { role: 'assistant', content: 'C1', reasoning_content: 'R1' },
+    { role: 'user', content: 'Turn 2.' },
+    { role: 'assistant', content: 'C2', reasoning_content: 'R2' },
+    { role: 'user', content: 'Turn 3.' },
+    { role: 'assistant', content: 'C3', reasoning_content: 'R3' },
+    { role: 'user', content: 'Turn 4.' },
+    { role: 'assistant', content: 'C4', reasoning_content: 'R4' },
+    { role: 'user', content: 'Turn 5.' },
+    { role: 'assistant', content: 'C5', reasoning_content: 'R5' },
+    { role: 'user', content: 'Turn 6.' },
+    { role: 'assistant', content: 'C6', reasoning_content: 'R6' },
+    { role: 'user', content: 'Turn 7.' },
+    { role: 'assistant', content: 'C7', reasoning_content: 'R7' },
+    { role: 'user', content: 'Turn 8.' },
+    { role: 'assistant', content: 'C8', reasoning_content: 'R8' },
+    { role: 'user', content: 'Turn 9.' }
+  ],
+  // other request parameters ...
+}
+```
+
+The expected next response is:
+
+```js
+{ role: 'assistant', content: 'C9', reasoning_content: 'R9' }
+```
+
+A failure mode is that the model starts reasoning from scratch instead of continuing the existing reasoning thread, for example:
+
+```js
+{
+  role: 'assistant',
+  content: 'C9',
+  reasoning_content: 'We need answer? The user is giving "Turn 1." then assistant "C1" etc. ...'
+}
+```
+
+The point is not merely to preserve the visible conversation. The model should be able to continue both the **conversation thread** and the **reasoning thread**. Replaying the prior reasoning can matter for models trained or configured to rely on it across turns; dropping or modifying it may cause the model to re-derive earlier steps, lose continuity, or spend extra reasoning tokens.
+
+This is not a universal behaviour of every model or API. Some providers require previous reasoning to be replayed exactly and in order; others ignore it unless specific request parameters are present; some reject it. The provider-specific notes below describe those differences. The extension can only re-attach reasoning that SillyTavern actually stored, and the model/provider must support the relevant contract.
+
 ## Features
 
 * Client-side equivalent of the Kimi/GLM thinking prefill server patch.
 * Re-attaches stored `extra.reasoning` as `reasoning_content` for previous assistant messages, with selectable strategies to trade reasoning tokens against context budget.
-* Correctly aligns preserved reasoning when SillyTavern trims the beginning of the chat history.
+* Aligns preserved reasoning to the correct outgoing assistant messages when SillyTavern trims, inserts, drops, or edits messages, using a longest common subsequence (LCS) match rather than a greedy end-based match.
 * Optional post-attachment context trimming to keep the request within the configured SillyTavern context budget.
 * Optional multi-turn reasoning for DeepSeek, which otherwise discards historical `reasoning_content` — see [Multi-turn reasoning on DeepSeek](#multi-turn-reasoning-on-deepseek).
 * Optional reasoning prefill support.
@@ -16,11 +67,24 @@ This is a fork of [Rurijian/KimiThinkingPrefill](https://github.com/Rurijian/Kim
 
 ## Additional fixes in this fork
 
-### Preserved reasoning and context trimming
+### Preserved reasoning and message alignment
 
-The original extension matched chat messages from the beginning of the conversation. When SillyTavern removed older messages because of context limits, reasoning from the beginning of the chat could be attached to newer messages incorrectly.
+SillyTavern stores reasoning alongside chat turns, but the outgoing API payload does not carry stable identifiers that connect each message to its original chat turn. Before the request is sent, SillyTavern can also transform the history: for example, older turns can be trimmed, messages can be inserted or removed, and message text can be changed.
 
-This fork matches assistant messages from the end of the conversation, keeping the remaining history aligned when older messages are trimmed.
+The extension therefore reconstructs the correspondence by matching message text. The current implementation uses a **longest common subsequence (LCS)**: it finds the largest order-preserving set of matching chat turns and outgoing assistant messages. Both sequences are compared from oldest to newest, and the result preserves their original order.
+
+A simple greedy match is unsafe. A payload message that was injected by a preset or another prompt feature — and is not an actual stored chat turn — may have text identical to a candidate turn. Greedily assigning that message can consume the candidate and prevent later messages from being paired correctly, causing reasoning to be attached to the wrong turn or omitted from the turns that need it most.
+
+The LCS pairing prioritizes:
+
+1. **The maximum number of valid pairs.** A longer order-preserving match always wins.
+2. **Newer payload positions as a tie-breaker.** Among matches with the same number of pairs, the algorithm prefers the larger total of matched payload positions, biasing ambiguous matches towards the newest end. This is a sum-based tie-breaker, not a strict rule that every individual pair must be as far right as possible. If identical text appears multiple times, the text alone cannot always identify the true origin.
+
+The reasoning window (`Last K` or `Last K + Omitted`) is applied **after** pairing. This is intentional: selecting a smaller window must not alter which messages form the best overall correspondence. It also helps prevent an injected old message at the end of the payload from stealing a candidate needed to match newer turns.
+
+Before matching, messages that already have `reasoning_content` are left alone, and messages with no usable matching key are excluded. Matching keys account for relevant SillyTavern transformations and, in group chats, mirror the speaker-name prefix added to outgoing message content. If the text has been transformed in a way the extension cannot reliably reconstruct, it is safer for the message to remain unmatched than to attach reasoning to the wrong turn.
+
+The LCS calculation uses O(n × m) time for `n` candidate chat turns and `m` outgoing assistant messages. Text keys are interned so the inner comparison uses integer IDs rather than repeatedly comparing long message bodies. If matching fails, the error is contained and the outgoing payload is left untouched.
 
 ### Context budget
 
