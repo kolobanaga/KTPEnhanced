@@ -53,6 +53,22 @@
                 <small>Re-attaches stored <code>extra.reasoning</code> to previous assistant messages. Only turns that actually have stored reasoning are affected — a non-reasoning model or a source that was not asked for reasoning simply has none to send.</small>
             </div>
 
+            <div class="flex-container flexFlowColumn" id="ktf_reasoning_group_mode_row">
+                <label for="ktf_reasoning_group_mode">Group chats: whose reasoning is sent</label>
+                <select id="ktf_reasoning_group_mode" class="text_pole">
+                    <option value="full">All characters</option>
+                    <option value="curr_char">Only the current character</option>
+                    <option value="none">None</option>
+                </select>
+                <small>
+                    In a group chat several characters take turns, and only the one being
+                    generated is "you". <code>All characters</code> sends everyone's stored
+                    reasoning; <code>Only the current character</code> keeps the others out so the
+                    model is not told it thought things it never thought; <code>None</code> sends
+                    no prior reasoning at all. No effect outside group chats.
+                </small>
+            </div>
+
             <div class="flex-container flexFlowColumn" id="ktf_reasoning_send_count_row">
                 <label for="ktf_reasoning_send_count">How many latest reasonings to send</label>
                 <input id="ktf_reasoning_send_count" class="text_pole" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off">

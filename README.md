@@ -82,6 +82,20 @@ Practical consequences for the strategies above:
 
 > **Caveat — not validated for roleplay.** All of the above is transcribed from vendor documentation that was written for coding and agentic workloads. This extension was designed around roleplay, where the priorities differ: a long narrative history, little or no tool use, and coherence of the *story* rather than of the reasoning chain. The practical effect of `Last K` / `Last K + Omitted` on those models in an RP chat is therefore **unverified** and needs empirical checking against your own chats before treating any of it as settled — measure output quality, not just token counts.
 
+### Group chats
+
+In a group chat several characters take turns, and only the one being generated is "the model". SillyTavern prefixes every message with its speaker name in the outgoing request (`names_behavior`), so the extension mirrors that prefix when it matches chat turns to request messages — without it, nothing matches in a group chat and no prior reasoning is sent at all, silently.
+
+The dropdown **Group chats: whose reasoning is sent** narrows that further:
+
+| Mode | Behaviour |
+| --- | --- |
+| `All characters` | Every character's stored reasoning is re-attached (default). |
+| `Only the current character` | Only the turns of the character being generated right now. Keeps the other characters' thinking out of the request, so the model is not told it reasoned about turns it never wrote. |
+| `None` | No prior reasoning is attached at all in a group chat. |
+
+The setting only applies to group chats; everywhere else every character's reasoning is re-attached as usual. It is shown only while **Prior reasoning sent to the API** is not `None`, since it narrows a feature that is off. Note that `Only the current character` intentionally leaves the other characters' request messages without `reasoning_content`, so they appear as unmatched in the debug log — that is the mode working, not a fault.
+
 ### Trim to budget
 
 After attaching preserved reasoning, checks the estimated token usage again and removes the oldest user/assistant history messages until the request fits the configured context budget.

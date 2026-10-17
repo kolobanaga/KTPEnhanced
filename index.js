@@ -1,4 +1,4 @@
-// KTPEnhanced
+﻿// KTPEnhanced
 // Client-side equivalent of the server patch from https://rentry.org/kimi-k3-jb
 // (files.catbox.moe/6mfxf5.patch). Instead of patching the SillyTavern server,
 // this extension hooks CHAT_COMPLETION_SETTINGS_READY and rewrites the outgoing
@@ -14,11 +14,13 @@
 //      from the stored `extra.reasoning` chat field, so providers that
 //      require prior reasoning to be passed back do not return a 400. Which
 //      messages are covered is chosen by the `reasoning_send_mode` strategy
-//      (none / all / last-k / last-k-with-placeholder) — see REASONING_MODE.
-//      The payload carries no message identifiers, so the correspondence is
-//      recovered from the text as the longest order-preserving pairing of
-//      payload messages with the chat turns that stored reasoning
-//      (see pairWithCandidates).
+//      (none / all / last-k / last-k-with-placeholder) — see REASONING_MODE —
+//      and in a group chat further narrowed by `reasoning_group_mode`
+//      (see GROUP_MODE). The payload carries no message identifiers, so the
+//      correspondence is recovered from the text as the longest
+//      order-preserving pairing of payload messages with the chat turns that
+//      stored reasoning (see pairWithCandidates), with the core's
+//      speaker-name prefix mirrored onto the chat-side key (see chatTurnKey).
 //   3. Injection: if the last message is NOT an assistant message and the user
 //      has configured a reasoning prefill below, a trailing assistant message
 //      { role: 'assistant', content: '', reasoning_content: prefill, partial: true }
@@ -78,6 +80,39 @@ const REASONING_WINDOW_MODES = new Set([REASONING_MODE.LAST, REASONING_MODE.OMIT
 
 const DEFAULT_REASONING_COUNT = 3;
 
+// Whose reasoning is sent back in a GROUP chat. A group chat interleaves turns
+// of several characters, and only the currently generating one is "the model" —
+// sending the others' reasoning costs input tokens and, worse, tells the model
+// it thought things it never thought.
+// FULL       - every character's reasoning is sent (the default; without it a
+//              group chat loses all prior reasoning, see chatTurnKey).
+// CURR_CHAR  - only the turns of the character that is generating right now.
+// NONE       - no prior reasoning at all in a group chat. Outside a group chat
+//              the setting has no effect.
+const GROUP_MODE = {
+    NONE: 'none',
+    FULL: 'full',
+    CURR_CHAR: 'curr_char',
+};
+
+const GROUP_MODES = new Set(Object.values(GROUP_MODE));
+
+// `names_behavior` values of the core, which prefixes `${chat[j].name}: ` to
+// the payload content and so rewrites the text the pairing compares
+// (openai.js:586-603). Copied, not imported: the enum is internal to openai.js
+// and is not exported.
+//
+// The numbers are NOT a 0-based enumeration — NONE is -1 and DEFAULT is 0. A
+// payload dump showing `names_behavior: 0` means DEFAULT, i.e. names ARE being
+// prefixed in a group chat, and reading it as "names are off" sends the whole
+// diagnosis the wrong way.
+const NAMES_BEHAVIOR = {
+    NONE: -1,
+    DEFAULT: 0,
+    COMPLETION: 1,
+    CONTENT: 2,
+};
+
 // Default text for the turns outside the window. Wording matters: it lands in
 // the model's own reasoning channel, so it is phrased as a note to self about
 // context budget, NOT as a redaction. "elided" is the neutral editorial term,
@@ -109,6 +144,9 @@ const defaultSettings = {
     // Size of that window: how many of the newest reasonings are forwarded
     // verbatim by the LAST / OMIT_OLDER strategies.
     reasoning_send_count: DEFAULT_REASONING_COUNT,
+
+    // Group chats only: whose reasoning gets re-attached at all (GROUP_MODE).
+    reasoning_group_mode: GROUP_MODE.FULL,
 
     // Text sent instead of the reasoning of the turns that fall outside that
     // window. An empty value means "send nothing" there, i.e. OMIT_OLDER
@@ -168,6 +206,11 @@ function getSettings() {
     // 0 is a legal choice (send no real reasoning at all) and is kept as-is.
     if (!Number.isFinite(Number(settings.reasoning_send_count)) || Number(settings.reasoning_send_count) < 0) {
         settings.reasoning_send_count = DEFAULT_REASONING_COUNT;
+    }
+    // Same defensive repair as the strategy above: an unknown group mode would
+    // otherwise silently widen or narrow what gets sent.
+    if (!GROUP_MODES.has(settings.reasoning_group_mode)) {
+        settings.reasoning_group_mode = defaultSettings.reasoning_group_mode;
     }
 
     return settings;
@@ -326,6 +369,53 @@ function matchKey(text) {
     }
     const key = text.replace(/\r/g, '').trim();
     return key || null;
+}
+
+/**
+ * Matching key of a CHAT turn, with the speaker-name prefix the core puts on
+ * the payload content mirrored onto the stored text.
+ *
+ * This is what makes a group chat pair at all. With `names_behavior` at the
+ * core default (DEFAULT) every message whose speaker is not the user gets
+ * `${name}: ` in front of it in the payload (openai.js:586-603), so the raw
+ * `mes` of a character turn never equals the payload text: nothing pairs, the
+ * extension attaches no reasoning, and it does so silently. Verified on a live
+ * log — `names_behavior: 0`, i.e. DEFAULT, and payload content
+ * `Char_2: Hi!` against chat `Hi!`
+ *
+ * The prefix is added HERE, on the chat side, rather than stripped from the
+ * payload text: stripping `Name: ` off the payload is ambiguous as soon as two
+ * characters share a name, and several chat turns would then claim one payload
+ * message — reasoning attributed to the wrong turn, the one failure mode this
+ * whole mechanism exists to avoid. Mirroring has no such ambiguity because the
+ * chat side knows its own speaker.
+ *
+ * The core's narrator exception (`extra.type === 'narrator'`) is deliberately
+ * NOT mirrored: such a message is sent with role 'system'
+ * (openai.js:581-583), so it is filtered out on both sides before it could
+ * become a key. The only turns this function is ever called for are assistant
+ * ones, and for those the core prefixes unconditionally.
+ *
+ * The prefix goes on BEFORE matchKey, not after: the core substitutes macros
+ * into the already-prefixed content (openai.js:946 runs after
+ * setOpenAIMessages), so a `{{char}}` prefix resolves on both sides alike.
+ * @param {object} message Chat turn
+ * @param {{namesBehavior: number, name1: string, isGroupChat: boolean}} names Core state at request time
+ * @returns {string|null} Normalized key, or null for text that cannot match
+ */
+function chatTurnKey(message, names) {
+    let text = message.mes;
+    const isUser = message.name === names.name1;
+    if (names.namesBehavior === NAMES_BEHAVIOR.CONTENT) {
+        text = `${message.name}: ${text}`;
+    } else if (names.namesBehavior === NAMES_BEHAVIOR.DEFAULT) {
+        // In a group chat every non-user speaker is prefixed; outside one, only
+        // a /sendas turn (force_avatar) is.
+        if ((names.isGroupChat && !isUser) || (message.force_avatar && !isUser)) {
+            text = `${message.name}: ${text}`;
+        }
+    }
+    return matchKey(text);
 }
 
 // The three steps of the pairing DP, written into the traceback as bytes: leave
@@ -504,15 +594,20 @@ function pairWithCandidates(candidates, messages) {
  * payload messages with chat turns that stored reasoning (see
  * pairWithCandidates).
  *
- * Two things the core does on its own still have to be mirrored:
+ * Three things the core does on its own still have to be mirrored:
  *   - On swipe the core drops the last chat message from the payload
  *     (script.js:4438-4440), so it is skipped here as well. On regenerate the
  *     core instead removes the message from the chat itself
  *     (script.js:4346-4353), which is why no pop is needed for that type.
  *   - Messages flagged with the shared IGNORE_SYMBOL never reach the payload
  *     and are skipped so they cannot claim a payload message's text.
+ *   - The speaker-name prefix the core puts on the payload content
+ *     (openai.js:586-603), mirrored by chatTurnKey. In a group chat at the
+ *     core default `names_behavior` this is the whole ballgame: without it
+ *     nothing pairs and the extension returns no reasoning at all.
  *
- * How much of that reasoning is sent is the `reasoning_send_mode` strategy:
+ * How much of that reasoning is sent is the `reasoning_send_mode` strategy,
+ * narrowed further in a group chat by `reasoning_group_mode` (GROUP_MODE):
  * only the payloads are touched, the stored `extra.reasoning` in the chat is
  * never modified, so switching strategies back and forth is lossless.
  * @param {object} generateData Outgoing request payload
@@ -523,8 +618,27 @@ function attachPriorReasoning(generateData) {
     const mode = settings.reasoning_send_mode;
     if (mode === REASONING_MODE.NONE) return 0;
 
-    const chat = SillyTavern.getContext().chat;
+    const context = SillyTavern.getContext();
+    const chat = context.chat;
     if (!Array.isArray(chat)) return 0;
+
+    // Core state the chat-side key has to mirror, read once here: the speaker
+    // prefix depends on all three, and they are the same values for every turn
+    // of this request.
+    const names = {
+        namesBehavior: context.chatCompletionSettings?.names_behavior,
+        name1: context.name1,
+        isGroupChat: Boolean(context.groupId),
+    };
+    const groupMode = settings.reasoning_group_mode;
+    if (names.isGroupChat && groupMode === GROUP_MODE.NONE) {
+        debugLog(`Prior reasoning: skipped, group chat and group mode is ${GROUP_MODE.NONE}.`);
+        return 0;
+    }
+    // Who is generating right now. `char_name` is what the core put in the
+    // request it just built; name2 is the fallback for sources that do not set
+    // it. Both name the character being generated, not the user.
+    const currentChar = generateData?.char_name || context.name2 || null;
 
     const IGNORE_SYMBOL = Symbol.for('ignore');
     // Chat assistant messages, newest first. filter() keeps the chat order, so
@@ -543,9 +657,25 @@ function attachPriorReasoning(generateData) {
     // window strategies count THESE slots rather than plain assistant turns, so
     // a stretch of turns without reasoning (e.g. a non-reasoning model, or a
     // source that was not asked to return it) does not eat into the window.
-    const candidates = chatAssistantMsgs
+    //
+    // The key is built by chatTurnKey, not matchKey: in a group chat the core
+    // prefixes the payload content with the speaker name, and without that
+    // prefix on this side not a single turn pairs.
+    const reasoningTurns = chatAssistantMsgs
         .filter(m => typeof m.extra?.reasoning === 'string' && m.extra.reasoning.trim())
-        .map(m => ({ key: matchKey(m.mes), reason: m.extra.reasoning }));
+        .map(m => ({ key: chatTurnKey(m, names), name: m.name, reason: m.extra.reasoning }));
+
+    // Group mode CURR_CHAR narrows the candidate set to the character being
+    // generated. Filtering here rather than after the pairing is safe: the
+    // pairing only needs the order, and a subsequence of the candidates keeps
+    // it. The payload is NOT touched — it is the request, and dropping other
+    // characters' messages from it would change what the model sees.
+    let candidates = reasoningTurns;
+    if (names.isGroupChat && groupMode === GROUP_MODE.CURR_CHAR) {
+        const before = candidates.length;
+        candidates = candidates.filter(c => c.name === currentChar);
+        debugLog(`Prior reasoning: group mode ${GROUP_MODE.CURR_CHAR}, kept ${candidates.length} of ${before} reasoning turn(s) — only those of "${currentChar}".`);
+    }
 
     // Duplicate keys are the one case the text alone cannot resolve: two turns
     // (or an injection copying a turn) share a text, so only one of the payload
@@ -617,6 +747,15 @@ function attachPriorReasoning(generateData) {
         // `unmatchedTexts` are both in payload order, oldest first.
         debugLog('Prior reasoning detail:', {
             generationType: lastGenerationType ?? 'unknown',
+            // Group-chat state, because it changes what a correct log looks
+            // like: under CURR_CHAR the payload messages of the other
+            // characters are expected to show up in `unmatchedTexts`, and
+            // `namesBehavior` decides whether the keys carry a speaker prefix.
+            groupChat: names.isGroupChat,
+            groupMode: names.isGroupChat ? groupMode : 'n/a',
+            currentChar,
+            namesBehavior: names.namesBehavior,
+            userName: names.name1,
             duplicateKeys,
             // Cost of the pairing itself, and the size it ran on. Quadratic in
             // the product, so a long chat is only expensive if many of its
@@ -816,7 +955,6 @@ async function onChatCompletionSettingsReady(generateData) {
             messages: generateData.messages.length,
             roles: generateData.messages.reduce((acc, m) => { acc[m?.role ?? '?'] = (acc[m?.role ?? '?'] ?? 0) + 1; return acc; }, {}),
         });
-
         // Model gate (patch used model.includes('moonshot'); this is configurable).
         if (!matchesModelFilter(generateData.model)) {
             debugLog('Skipped: model does not match filter.', generateData.model);
@@ -981,18 +1119,23 @@ jQuery(async () => {
     bindSetting('#ktf_force_thinking', 'force_thinking', { isCheckbox: true });
     bindSetting('#ktf_debug_log', 'debug_log', { isCheckbox: true });
     bindSetting('#ktf_reasoning_send_mode', 'reasoning_send_mode');
+    bindSetting('#ktf_reasoning_group_mode', 'reasoning_group_mode');
     bindSetting('#ktf_reasoning_send_count', 'reasoning_send_count', { isNumber: true });
     bindSetting('#ktf_reasoning_placeholder', 'reasoning_placeholder');
     bindSetting('#ktf_trim_to_budget', 'trim_to_budget', { isCheckbox: true });
 
     // The window size applies to both windowed strategies, the placeholder only
     // to the one that uses it, so each row is shown exclusively for its modes.
+    // The group strategy narrows the same feature, so it is pointless while that
+    // feature is off entirely.
     const $sendMode = $('#ktf_reasoning_send_mode');
     const $sendCount = $('#ktf_reasoning_send_count_row');
     const $placeholder = $('#ktf_reasoning_placeholder_row');
+    const $groupMode = $('#ktf_reasoning_group_mode_row');
     const syncSendRows = () => {
         $sendCount.toggle(REASONING_WINDOW_MODES.has($sendMode.val()));
         $placeholder.toggle($sendMode.val() === REASONING_MODE.OMIT_OLDER);
+        $groupMode.toggle($sendMode.val() !== REASONING_MODE.NONE);
     };
     $sendMode.on('change', syncSendRows);
     syncSendRows();
