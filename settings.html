@@ -104,6 +104,23 @@
                 and drops the oldest user/assistant turns to fit "Context Size" minus "Response (tokens)".
             </small>
 
+            <div id="ktf_fake_tools_row">
+                <div class="flex-container">
+                    <label class="flex-container">
+                        <input type="checkbox" id="ktf_fake_tools">
+                        <small>Send a placeholder tool to enable multi-turn reasoning (DeepSeek)</small>
+                    </label>
+                </div>
+                <small class="ktf-hint">
+                    DeepSeek drops the <code>reasoning_content</code> of earlier turns unless the request
+                    carries tool definitions, so this adds one never-callable <code>noop_placeholder</code>
+                    function to flip that. DeepSeek's own endpoint documents that a request with tools must
+                    replay every prior <code>reasoning_content</code> verbatim or it answers 400, so keep this
+                    on <code>All</code> above there; other providers do not enforce it. If the model calls the
+                    placeholder anyway, the resulting tool messages turn this extension off for that chat.
+                </small>
+            </div>
+
             <div class="flex-container">
                 <label class="flex-container">
                     <input type="checkbox" id="ktf_debug_log">

@@ -10,6 +10,7 @@ This is a fork of [Rurijian/KimiThinkingPrefill](https://github.com/Rurijian/Kim
 * Re-attaches stored `extra.reasoning` as `reasoning_content` for previous assistant messages, with selectable strategies to trade reasoning tokens against context budget.
 * Correctly aligns preserved reasoning when SillyTavern trims the beginning of the chat history.
 * Optional post-attachment context trimming to keep the request within the configured SillyTavern context budget.
+* Optional multi-turn reasoning for DeepSeek, which otherwise discards historical `reasoning_content` — see [Multi-turn reasoning on DeepSeek](#multi-turn-reasoning-on-deepseek).
 * Optional reasoning prefill support.
 * No modifications to the SillyTavern server.
 
@@ -75,12 +76,31 @@ The windowed strategies are a deliberate trade-off, not a free win. Providers do
 Practical consequences for the strategies above:
 
 * `All` is the only contract-compliant option for `kimi-k3` and for GLM's Preserved Thinking. `Last K` is literally a truncation and `Last K + Omitted` is literally an edit, which is what those docs warn against.
-* DeepSeek V4 (and MiMo) can return 400 when a request carries tools and a previous turn lost its `reasoning_content`. **This extension cannot trigger that**: the handler bails out before attaching anything whenever tools are in play. The check predates the strategies below and also covers tool messages and `tool_calls` already present in the history, not just a `tools` array in the request — so it is stricter than the documented DeepSeek rule. The price is that the strategies and the budget trimming are inert on tool requests too. Requests without tools are unaffected, and there DeepSeek ignores the field rather than concatenating it, so the window is free.
+* DeepSeek V4 (and MiMo) can return 400 when a request carries tools and a previous turn lost its `reasoning_content`. **The extension never triggers that by accident**: the handler bails out before attaching anything whenever tools are in play. The check predates the strategies below and also covers tool messages and `tool_calls` already present in the history, not just a `tools` array in the request — so it is stricter than the documented DeepSeek rule. The price is that the strategies and the budget trimming are inert on tool requests too. Requests without tools are unaffected, and there DeepSeek ignores the field rather than concatenating it, so the window is free. The one deliberate exception is [Multi-turn reasoning on DeepSeek](#multi-turn-reasoning-on-deepseek), which opts into sending `tools` on purpose.
 * OpenRouter documents preserving reasoning for user-defined tools, but its server tools appear to work the other way round (previous history dropped). There is an explicit control for that — `reasoning.context: "current_turn"` versus `"all_turns"` — though OpenRouter lists it as supported only by OpenAI GPT-5.6 and newer, so it is not an available lever for the `reasoning_content` lineage this extension targets.
 * The economy argument inverts for models trained on preserved thinking — dropping reasoning can cost more tokens than it saves, because the model re-derives what it already concluded. A window is most defensible where the context is dominated by the chat itself rather than by reasoning continuity.
 * Field naming differs per provider (`reasoning_content`, `reasoning`, `reasoning_details[]`, inline `<think>`), and sending the wrong one can also be a hard 400 — e.g. GLM-4.7 on Cerebras rejects `reasoning_content` and expects `reasoning`.
 
 > **Caveat — not validated for roleplay.** All of the above is transcribed from vendor documentation that was written for coding and agentic workloads. This extension was designed around roleplay, where the priorities differ: a long narrative history, little or no tool use, and coherence of the *story* rather than of the reasoning chain. The practical effect of `Last K` / `Last K + Omitted` on those models in an RP chat is therefore **unverified** and needs empirical checking against your own chats before treating any of it as settled — measure output quality, not just token counts.
+
+### Multi-turn reasoning on DeepSeek
+
+DeepSeek is the awkward entry in the table above. Without `tools` on the request it drops the `reasoning_content` of every turn before the last user message, so re-attaching it achieves nothing — the field is accepted and then silently ignored. With `tools` present it concatenates all of it instead. There is no documented way to ask for the second behaviour directly: `chat_template_kwargs.drop_thinking: false` is a vLLM chat-template passthrough, and on an NVIDIA NIM endpoint it reached the request without changing the reply.
+
+The optional **Send a placeholder tool** setting exploits the side effect instead. It adds a single function definition to `generateData.tools` — `noop_placeholder`, no parameters, described to the model as never-callable — which is enough to flip the gate.
+
+> **This enforces behaviour DeepSeek does not document as a supported mode.** It is an undocumented side effect of a documented rule, not a contracted feature: the reasoning gate is an implementation detail of DeepSeek's chat encoder, and the setting stops working if DeepSeek changes how that decision is made. There is no promise from the vendor that it keeps working.
+
+The setting is hidden while **Prior reasoning sent to the API** is `None`, because the tool exists to make DeepSeek keep the reasoning this extension sends — with nothing sent there is nothing to keep. It is injected deliberately *after* the guard that switches the extension off on tool requests, so a request that already uses real tools is untouched.
+
+Verified on `deepseek-ai/deepseek-v4.1-flash` through NVIDIA NIM: with the placeholder the model answered `R9 C9` across nine turns, without it a single-turn reasoning and `C9`. Whether the documented 400 for an incomplete reasoning replay is enforced on that endpoint is **not verified** — every send strategy, including the windowed ones, was accepted there, but DeepSeek's own endpoint is documented to require the full replay.
+
+Two costs worth weighing:
+
+* Reasoning that used to be discarded is now billed as input tokens for the whole history, so [Trim to budget](#trim-to-budget) starts dropping real chat turns sooner. The feature and its price arrive together: on a small context the trimmed turns take the preserved reasoning with them, which can leave the request no better off than before.
+* If the model calls the placeholder despite the description, SillyTavern turns the invocation into a tool message, and the extension then disables itself for that chat until those messages are gone.
+
+One gap in the budget path: it estimates `generateData.messages` and never adds the tool schema, so a trimmed request carries a few dozen tokens more than the trim concluded it could afford. That sits inside the estimator's stated accuracy, and it only starts to matter when the budget is small enough for a few dozen tokens to be a visible share of it.
 
 ### Group chats
 
@@ -102,7 +122,9 @@ After attaching preserved reasoning, checks the estimated token usage again and 
 
 Enabled by default.
 
-Note that this is skipped entirely on requests that involve tools: the handler returns before reasoning is attached, so neither the strategies nor this trimming run there. That guard is inherited from the original thinking-prefill patch and has never been relaxed.
+On requests that involve real tools the handler returns before reasoning is attached, so neither the strategies nor this trimming run there. That guard is inherited from the original thinking-prefill patch and has never been relaxed.
+
+The one exception is the opt-in placeholder tool of [Multi-turn reasoning on DeepSeek](#multi-turn-reasoning-on-deepseek). It is injected *after* that guard on purpose, so with it enabled the strategies and this trimming run exactly as they do on a request without tools — there is nothing tool-specific about the budget path.
 
 ### Thinking prefill
 
