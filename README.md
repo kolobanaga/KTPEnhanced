@@ -4,29 +4,35 @@ A SillyTavern extension for Kimi/GLM models that enables client-side handling of
 
 This is a fork of [Rurijian/KimiThinkingPrefill](https://github.com/Rurijian/KimiThinkingPrefill), with additional fixes for preserved reasoning and context-budget handling.
 
-## What is Preserved Thinking / Multi-turn Reasoning?
+## Contents
 
-Different labs and providers use different names for closely related behaviour, including **Preserved Thinking**, **Multi-turn Reasoning**, **Interleaved Thinking**, **Reasoning Persistence**, and **CoT Persistence**. The exact API contract varies by provider, but the shared idea is that a model's reasoning is carried forward from one turn to the next instead of being discarded after each response.
+- [What is Preserved Thinking and Multi-turn Reasoning?](#what-is-preserved-thinking-and-multi-turn-reasoning)
+- [Features](#features)
+- [Preserved reasoning and message alignment (LCS)](#preserved-reasoning-and-message-alignment)
+- [Context budget](#context-budget)
+- [Settings](#settings)
+  - [Prior reasoning to the API](#prior-reasoning-to-the-api)
+  - [Provider-specific model contracts](#model-contracts-behind-the-strategies)
+  - [Personal RP observation: GLM 5.1 vs GLM 5.3](#personal-rp-observation-glm-51-vs-glm-53)
+  - [Multi-turn reasoning on DeepSeek](#multi-turn-reasoning-on-deepseek)
+  - [Group chats](#group-chats)
+  - [Trim to budget](#trim-to-budget)
+  - [Thinking prefill](#thinking-prefill)
+- [Limitations and token budget](#limitations-and-token-budget)
+- [Credits](#credits)
 
-In a typical chat-completion request, the conversation contains alternating user messages and assistant messages. An assistant message may have both a user-facing answer (`content`) and a separate reasoning field (`reasoning_content`). For multi-turn reasoning, the client sends the previous assistant reasoning back as part of the conversation history, alongside the corresponding answer:
+## What Is Preserved Thinking and Multi-turn Reasoning?
+
+Different labs and providers use overlapping terms for related behaviour: **Preserved Thinking**, **Multi-turn Reasoning**, **Interleaved Thinking**, **Reasoning Persistence**, and **CoT Persistence**. These labels are not always exact synonyms, and the API requirements vary, but this README uses them as a broad family of techniques for carrying previous assistant reasoning into later requests instead of discarding it after every response.
+
+A chat-completion message may contain both the user-facing answer (`content`) and a separate reasoning field (`reasoning_content`). In the example below, `C` stands for the visible answer and `R` for that turn's reasoning:
 
 ```js
 {
   messages: [
     { role: 'user', content: 'Turn 1.' },
     { role: 'assistant', content: 'C1', reasoning_content: 'R1' },
-    { role: 'user', content: 'Turn 2.' },
-    { role: 'assistant', content: 'C2', reasoning_content: 'R2' },
-    { role: 'user', content: 'Turn 3.' },
-    { role: 'assistant', content: 'C3', reasoning_content: 'R3' },
-    { role: 'user', content: 'Turn 4.' },
-    { role: 'assistant', content: 'C4', reasoning_content: 'R4' },
-    { role: 'user', content: 'Turn 5.' },
-    { role: 'assistant', content: 'C5', reasoning_content: 'R5' },
-    { role: 'user', content: 'Turn 6.' },
-    { role: 'assistant', content: 'C6', reasoning_content: 'R6' },
-    { role: 'user', content: 'Turn 7.' },
-    { role: 'assistant', content: 'C7', reasoning_content: 'R7' },
+    // Turns 2–8 follow the same user/assistant pattern.
     { role: 'user', content: 'Turn 8.' },
     { role: 'assistant', content: 'C8', reasoning_content: 'R8' },
     { role: 'user', content: 'Turn 9.' }
@@ -35,25 +41,11 @@ In a typical chat-completion request, the conversation contains alternating user
 }
 ```
 
-The expected next response is:
+The expected next response is `{ role: 'assistant', content: 'C9', reasoning_content: 'R9' }`. A failure mode is that the model starts reasoning from scratch instead of continuing the existing reasoning thread, for example: `reasoning_content: "Let me work through this from the beginning..."` despite the previous turns already containing reasoning.
 
-```js
-{ role: 'assistant', content: 'C9', reasoning_content: 'R9' }
-```
+The point is not merely to preserve the visible conversation: the model should be able to continue both the **conversation thread** and the **reasoning thread**. Dropping or changing historical reasoning can make some models re-derive earlier steps, lose continuity, or spend extra reasoning tokens.
 
-A failure mode is that the model starts reasoning from scratch instead of continuing the existing reasoning thread, for example:
-
-```js
-{
-  role: 'assistant',
-  content: 'C9',
-  reasoning_content: 'We need answer? The user is giving "Turn 1." then assistant "C1" etc. ...'
-}
-```
-
-The point is not merely to preserve the visible conversation. The model should be able to continue both the **conversation thread** and the **reasoning thread**. Replaying the prior reasoning can matter for models trained or configured to rely on it across turns; dropping or modifying it may cause the model to re-derive earlier steps, lose continuity, or spend extra reasoning tokens.
-
-This is not a universal behaviour of every model or API. Some providers require previous reasoning to be replayed exactly and in order; others ignore it unless specific request parameters are present; some reject it. The provider-specific notes below describe those differences. The extension can only re-attach reasoning that SillyTavern actually stored, and the model/provider must support the relevant contract.
+This is not a universal behaviour of every model or API. Some providers require previous reasoning to be replayed exactly and in order; others ignore it unless specific request parameters are present; some reject it. The provider-specific notes below describe those differences. KTPEnhanced can only re-attach reasoning that SillyTavern actually stored, and the model/provider must support the relevant request format.
 
 ## Features
 
@@ -75,16 +67,21 @@ The extension therefore reconstructs the correspondence by matching message text
 
 A simple greedy match is unsafe. A payload message that was injected by a preset or another prompt feature — and is not an actual stored chat turn — may have text identical to a candidate turn. Greedily assigning that message can consume the candidate and prevent later messages from being paired correctly, causing reasoning to be attached to the wrong turn or omitted from the turns that need it most.
 
+The important user-facing guarantee is that matching stays **in order** and prioritizes the largest valid set of pairs. The `Last K` window is applied **after** pairing, so a smaller window does not distort the underlying correspondence. This also helps prevent an injected old message at the end of the payload from stealing a candidate needed to match newer turns.
+
+Before matching, messages that already have `reasoning_content` are left alone, and messages with no usable matching key are excluded. Matching keys account for relevant SillyTavern transformations and, in group chats, mirror the speaker-name prefix added to outgoing message content. If the text has been transformed in a way the extension cannot reliably reconstruct, it is safer for the message to remain unmatched than to attach reasoning to the wrong turn.
+
+<details>
+<summary>Implementation details: tie-breaking and complexity</summary>
+
 The LCS pairing prioritizes:
 
 1. **The maximum number of valid pairs.** A longer order-preserving match always wins.
 2. **Newer payload positions as a tie-breaker.** Among matches with the same number of pairs, the algorithm prefers the larger total of matched payload positions, biasing ambiguous matches towards the newest end. This is a sum-based tie-breaker, not a strict rule that every individual pair must be as far right as possible. If identical text appears multiple times, the text alone cannot always identify the true origin.
 
-The reasoning window (`Last K` or `Last K + Omitted`) is applied **after** pairing. This is intentional: selecting a smaller window must not alter which messages form the best overall correspondence. It also helps prevent an injected old message at the end of the payload from stealing a candidate needed to match newer turns.
+The calculation uses O(n × m) time for `n` candidate chat turns and `m` outgoing assistant messages. Text keys are interned so the inner comparison uses integer IDs rather than repeatedly comparing long message bodies. If matching fails, the error is contained and the outgoing payload is left untouched.
 
-Before matching, messages that already have `reasoning_content` are left alone, and messages with no usable matching key are excluded. Matching keys account for relevant SillyTavern transformations and, in group chats, mirror the speaker-name prefix added to outgoing message content. If the text has been transformed in a way the extension cannot reliably reconstruct, it is safer for the message to remain unmatched than to attach reasoning to the wrong turn.
-
-The LCS calculation uses O(n × m) time for `n` candidate chat turns and `m` outgoing assistant messages. Text keys are interned so the inner comparison uses integer IDs rather than repeatedly comparing long message bodies. If matching fails, the error is contained and the outgoing payload is left untouched.
+</details>
 
 ### Context budget
 
@@ -111,6 +108,8 @@ This is useful for models that expect previous reasoning to be preserved between
 
 `K` is configured in the **How many latest reasonings to send** field (default `3`), shown only for the two windowed strategies. The placeholder is configured in the **Placeholder for omitted reasoning** field, shown only for `Last K + Omitted`; clearing it sends nothing for those turns, which makes that strategy behave like `Last K`.
 
+**A practical starting point:** use `All` when the provider explicitly requires the complete, unchanged reasoning history. Consider `Last K` when context pressure matters and the exact endpoint tolerates a shortened history; try `Last K + Omitted` when older turns should still be marked as having reasoning. These windowed modes save prompt space but can conflict with provider contracts, so evaluate them on the model and endpoint you actually use.
+
 Notes:
 
 * `K` counts *stored reasonings*, not assistant turns, so a stretch of turns without reasoning (for example from a non-reasoning model) does not silently consume the window.
@@ -121,37 +120,53 @@ Notes:
 
 #### Model contracts behind the strategies
 
-The windowed strategies are a deliberate trade-off, not a free win. Providers document conflicting requirements for historical reasoning, and the three models in the default **Apply to models matching** filter (`kimi,moonshot,GLM`) are the strictest of them.
+The strategies are a trade-off, not a universal optimization. Providers differ in what they require for historical reasoning: some accept only a complete, unchanged sequence, while others ignore the field unless a request parameter activates it. These contracts are written primarily for API/agent workflows; roleplay behaviour can differ in practice.
+
+<details>
+<summary>Detailed provider matrix and compatibility notes</summary>
 
 | Model | Thinking control | Cross-turn requirement |
 | --- | --- | --- |
-| `GLM-5.3`, `GLM-5.3-Flash` | always on — `thinking.type: "disabled"` fails the request; depth via `reasoning_effort` (`low`/`high`/`max`) | Preserved Thinking (`clear_thinking: false`) requires the historical `reasoning_content` **complete, unmodified and in its original order**; editing, trimming or reordering degrades quality and cache hit rate. On by default on the Coding Plan endpoint. |
-| `kimi-k3` | always on; the `thinking` parameter should not be sent; depth via top-level `reasoning_effort` | Preserved Thinking is **always on**: every historical assistant message must be returned as-is, and the docs state this is required for multi-turn *and* tool-call loops. |
-| `kimi-k2.6` / `kimi-k2.7-code` | `thinking.type` + `keep` (`null` by default / `"all"`); `k2.7-code` accepts only `{"type":"enabled","keep":"all"}` | Cross-turn preservation follows `keep`. `kimi-k2.5` has no Preserved Thinking at all. |
-| `deepseek-v4-pro` / `deepseek-v4-flash` | on by default | The gate is the `tools` parameter on the **request**, not whether a tool was actually called. With `tools` present, `reasoning_content` of **all previous turns** must be passed back, or the API returns `400 The reasoning_content in the thinking mode must be passed back to the API`. Without `tools` the field is ignored entirely and never concatenated into the context. |
-| `deepseek-reasoner` / R1 (legacy) | — | The opposite rule: `reasoning_content` must **not** be passed back, or the request fails. |
-| `qwen3.8` (DashScope) | `enable_thinking` | `preserve_thinking: true` (default `false`). The model is trained to keep its reasoning blocks in the conversation; when they are stripped it re-derives conclusions it had already reached — reportedly performing like a lower effort tier while spending *more* tokens. |
-| `MiMo V2.5` | — | Same 400 as DeepSeek V4 when the request carries tools and a previous turn lost its `reasoning_content`. |
-| OpenRouter, user-defined tools | `reasoning.effort` / `max_tokens` / `exclude` | Documented: echo reasoning back for tool use via `message.reasoning` (or the `reasoning_content` alias), or `message.reasoning_details` for encrypted/summarized blocks. The whole sequence of consecutive reasoning blocks must match what the model produced in the original request and cannot be rearranged or modified. |
-| OpenRouter, server tools | server-side execution, `openrouter:*` entries in the `tools` array | **Undocumented.** The [server tools guide](https://openrouter.ai/docs/guides/features/server-tools) never mentions reasoning. Observed in request logs: with server tools, `reasoning_content` from the earlier history is discarded and only the reasoning produced during that request's server-side tool loop survives — the opposite of the documented advice for user-defined tools. Treat as empirical behaviour, not a contract. |
+| `GLM-5.3`, `GLM-5.3-Flash` | always on — `thinking.type: "disabled"` fails the request; depth via `reasoning_effort` (`low`/`high`/`max`) | Preserved Thinking (`clear_thinking: false`) requires historical `reasoning_content` **complete, unmodified and in its original order**; editing, trimming or reordering may degrade quality and cache hit rate. On by default on the Coding Plan endpoint. |
+| `kimi-k3` | always on; do not send `thinking`; depth via top-level `reasoning_effort` | Preserved Thinking is **always on**: every historical assistant message must be returned as-is; documented as required for multi-turn and tool-call loops. |
+| `kimi-k2.6` / `kimi-k2.7-code` | `thinking.type` + `keep` (`null` by default / `"all"`); `k2.7-code` accepts only `{"type":"enabled","keep":"all"}` | Cross-turn preservation follows `keep`. `kimi-k2.5` has no Preserved Thinking. |
+| `deepseek-v4-pro` / `deepseek-v4-flash` | on by default | The gate is whether `tools` is present on the **request**, not whether a tool is called. With `tools`, all previous `reasoning_content` must be passed back or the API may return `400 The reasoning_content in the thinking mode must be passed back to the API`. Without `tools`, the field is ignored rather than added to context. |
+| `deepseek-reasoner` / R1 (legacy) | — | Opposite rule: `reasoning_content` must **not** be passed back, or the request fails. |
+| `qwen3.8` (DashScope) | `enable_thinking` | `preserve_thinking: true` (default `false`). The model is trained to keep reasoning blocks in the conversation; stripping them can make it re-derive earlier conclusions. |
+| `MiMo V2.5` | — | Same documented 400 as DeepSeek V4 when a request carries tools and a previous turn lost its `reasoning_content`. |
+| OpenRouter, user-defined tools | `reasoning.effort` / `max_tokens` / `exclude` | Documented: echo reasoning via `message.reasoning` (or `reasoning_content` alias), or `message.reasoning_details` for encrypted/summarized blocks. Consecutive reasoning blocks must remain in their original sequence and unmodified. |
+| OpenRouter, server tools | server-side execution; `openrouter:*` entries in `tools` | **Undocumented.** Request logs observed prior-history reasoning being discarded while reasoning from the server-side tool loop survived. Treat this as empirical behaviour, not a contract. |
 | `minimax-M2` (legacy) | always on | Thinking is inline `<think>` tags inside `content`, not a separate field. |
-| Anthropic / Gemini | separate request shapes | Reasoning is not a `reasoning_content` field: Anthropic uses signed thinking blocks and `clear_thinking_20251015` (keep the last N thinking turns, clearing older ones, which invalidates the cache from the clearing point); Gemini uses `thinkingConfig`. Out of scope for this extension. |
+| Anthropic / Gemini | separate request shapes | Reasoning is not a `reasoning_content` field: Anthropic uses signed thinking blocks and `clear_thinking_20251015`; Gemini uses `thinkingConfig`. Out of scope for this extension. |
 
-Practical consequences for the strategies above:
+Practical consequences:
 
-* `All` is the only contract-compliant option for `kimi-k3` and for GLM's Preserved Thinking. `Last K` is literally a truncation and `Last K + Omitted` is literally an edit, which is what those docs warn against.
-* DeepSeek V4 (and MiMo) can return 400 when a request carries tools and a previous turn lost its `reasoning_content`. **The extension never triggers that by accident**: the handler bails out before attaching anything whenever tools are in play. The check predates the strategies below and also covers tool messages and `tool_calls` already present in the history, not just a `tools` array in the request — so it is stricter than the documented DeepSeek rule. The price is that the strategies and the budget trimming are inert on tool requests too. Requests without tools are unaffected, and there DeepSeek ignores the field rather than concatenating it, so the window is free. The one deliberate exception is [Multi-turn reasoning on DeepSeek](#multi-turn-reasoning-on-deepseek), which opts into sending `tools` on purpose.
-* OpenRouter documents preserving reasoning for user-defined tools, but its server tools appear to work the other way round (previous history dropped). There is an explicit control for that — `reasoning.context: "current_turn"` versus `"all_turns"` — though OpenRouter lists it as supported only by OpenAI GPT-5.6 and newer, so it is not an available lever for the `reasoning_content` lineage this extension targets.
-* The economy argument inverts for models trained on preserved thinking — dropping reasoning can cost more tokens than it saves, because the model re-derives what it already concluded. A window is most defensible where the context is dominated by the chat itself rather than by reasoning continuity.
-* Field naming differs per provider (`reasoning_content`, `reasoning`, `reasoning_details[]`, inline `<think>`), and sending the wrong one can also be a hard 400 — e.g. GLM-4.7 on Cerebras rejects `reasoning_content` and expects `reasoning`.
+- `All` is the only option consistent with the documented full-history contract for `kimi-k3` and GLM Preserved Thinking. `Last K` truncates the sequence; `Last K + Omitted` edits older reasoning.
+- DeepSeek V4 (and MiMo) can return 400 when a request carries tools and a previous turn lost its `reasoning_content`. The extension normally exits before attaching reasoning whenever real tools are in play. The deliberate exception is [Multi-turn reasoning on DeepSeek](#multi-turn-reasoning-on-deepseek), which opts into sending a placeholder tool.
+- OpenRouter documents preserving reasoning for user-defined tools, but server tools have shown different behaviour in request logs. Its `reasoning.context: "current_turn"` / `"all_turns"` control is documented for newer OpenAI models and is not a general lever for the `reasoning_content` flow targeted here.
+- Dropping reasoning does not always save total tokens: some models may re-derive earlier conclusions and spend more reasoning tokens. The best trade-off depends on the model, endpoint, and workload.
+- Field names differ (`reasoning_content`, `reasoning`, `reasoning_details[]`, or inline `<think>`). Sending the wrong field can also cause a hard 400; for example, GLM-4.7 on Cerebras expects `reasoning` rather than `reasoning_content`.
 
-> **Caveat — not validated for roleplay.** All of the above is transcribed from vendor documentation that was written for coding and agentic workloads. This extension was designed around roleplay, where the priorities differ: a long narrative history, little or no tool use, and coherence of the *story* rather than of the reasoning chain. The practical effect of `Last K` / `Last K + Omitted` on those models in an RP chat is therefore **unverified** and needs empirical checking against your own chats before treating any of it as settled — measure output quality, not just token counts.
+</details>
+
+#### Personal RP observation: GLM 5.1 vs GLM 5.3
+
+I often use GLM-5-series models for roleplay because I like their prose and find their reactions the most human-like. I noticed a quality drop in GLM-5.3 compared with GLM-5.1: in ordinary use, GLM-5.3 more often misses small but important details and sometimes skips reasoning entirely, going straight to the response.
+
+To compare, I regenerated several swipes in an older chat whose replies and stored reasoning came from GLM-5.1, testing GLM-5.3 both with KTPEnhanced enabled (`Last K`, `K = 10`) and without it. The difference was noticeable: with preserved reasoning, both the reasoning and the resulting replies were substantially better and closer to GLM-5.1.
+
+This is an informal observation from one workflow, not a controlled benchmark. It does, however, show why a windowed strategy can be useful in RP even when it conflicts with some providers' documented full-history contracts. In practice, the tested model appeared able to use the retained reasoning coherently; this does **not** establish that every model/endpoint accepts or benefits from `Last K` or `Last K + Omitted`. Treat API requirements as constraints, and test output quality on the exact endpoint you use.
 
 ### Multi-turn reasoning on DeepSeek
 
-DeepSeek is the awkward entry in the table above. Without `tools` on the request it drops the `reasoning_content` of every turn before the last user message, so re-attaching it achieves nothing — the field is accepted and then silently ignored. With `tools` present it concatenates all of it instead. There is no documented way to ask for the second behaviour directly: `chat_template_kwargs.drop_thinking: false` is a vLLM chat-template passthrough, and on an NVIDIA NIM endpoint it reached the request without changing the reply.
+DeepSeek is an exception to the usual behaviour. On the tested V4-style path, without `tools` in the request, historical `reasoning_content` is accepted but ignored; with `tools` present, the endpoint can preserve it. There is no documented parameter for enabling the latter behaviour directly.
 
-The optional **Send a placeholder tool** setting exploits the side effect instead. It adds a single function definition to `generateData.tools` — `noop_placeholder`, no parameters, described to the model as never-callable — which is enough to flip the gate.
+The optional **Send a placeholder tool** setting uses this side effect: it adds a no-parameter `noop_placeholder` function to `generateData.tools`, described to the model as never-callable. This is an undocumented workaround, not a provider-supported feature.
+
+<details>
+<summary>DeepSeek implementation notes, verification, and caveats</summary>
+
+`chat_template_kwargs.drop_thinking: false` is a vLLM chat-template passthrough; on an NVIDIA NIM endpoint it reached the request without changing the reply. The placeholder tool is deliberately injected after the guard that disables the extension for requests already using real tools, so existing tool requests are left untouched.
 
 > **This enforces behaviour DeepSeek does not document as a supported mode.** It is an undocumented side effect of a documented rule, not a contracted feature: the reasoning gate is an implementation detail of DeepSeek's chat encoder, and the setting stops working if DeepSeek changes how that decision is made. There is no promise from the vendor that it keeps working.
 
@@ -165,6 +180,8 @@ Two costs worth weighing:
 * If the model calls the placeholder despite the description, SillyTavern turns the invocation into a tool message, and the extension then disables itself for that chat until those messages are gone.
 
 One gap in the budget path: it estimates `generateData.messages` and never adds the tool schema, so a trimmed request carries a few dozen tokens more than the trim concluded it could afford. That sits inside the estimator's stated accuracy, and it only starts to matter when the budget is small enough for a few dozen tokens to be a visible share of it.
+
+</details>
 
 ### Group chats
 
@@ -194,9 +211,9 @@ The one exception is the opt-in placeholder tool of [Multi-turn reasoning on Dee
 
 Optionally injects a `reasoning_content` prefill for the current generation. This is separate from preserved reasoning history.
 
-## Important
+## Limitations and token budget
 
-Preserved reasoning increases prompt size. A long reasoning history can consume a significant part of the available context. The windowed strategies exist to counter this — see [Model contracts behind the strategies](#model-contracts-behind-the-strategies) for what each provider documents, and for what is still unverified in a roleplay context.
+Preserved reasoning increases prompt size. A long reasoning history can consume a significant part of the available context. The windowed strategies exist to counter this — see [Model contracts behind the strategies](#model-contracts-behind-the-strategies) for documented provider requirements and the distinction between those requirements and informal RP observations.
 
 Token counts calculated by the extension are estimates and may differ from the exact token accounting performed by the model provider.
 
