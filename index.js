@@ -6,17 +6,17 @@
 //
 //   1. Patch parity: if the last message is an assistant message whose content
 //      starts with a leading reasoning block (see getReasoningTemplate), the
-//      block is moved into `reasoning_content` and the message is flagged
-//      `partial: true` (identical transform to the patched addAssistantPrefix).
-//      The block markers are read from the core's "Reasoning Formatting"
-//      template, so any template works, not just the <think> default.
-//      `partial` is a field of the Kimi API only, so the flag is attached only
-//      to the models listed in the partial filter (see supportsPartialMode).
+//      block is moved into `reasoning_content` (identical transform to the
+//      patched addAssistantPrefix). The block markers are read from the core's
+//      "Reasoning Formatting" template, so any template works, not just the
+//      <think> default. `partial` is a field of the Kimi API only, so the flag
+//      is attached only to the models listed in the partial filter (see
+//      supportsPartialMode) and is applied at the end of the hook.
 //   2. Re-attach: re-populates `reasoning_content` on prior assistant messages
 //      from the stored `extra.reasoning` chat field, so providers that
 //      require prior reasoning to be passed back do not return a 400. Which
 //      messages are covered is chosen by the `reasoning_send_mode` strategy
-//      (none / all / last-k / last-k-with-placeholder) — see REASONING_MODE —
+//      (none / all / last / omit_older) — see REASONING_MODE —
 //      and in a group chat further narrowed by `reasoning_group_mode`
 //      (see GROUP_MODE). The payload carries no message identifiers, so the
 //      correspondence is recovered from the text as the longest
@@ -25,9 +25,10 @@
 //      speaker-name prefix mirrored onto the chat-side key (see chatTurnKey).
 //   3. Injection: if the last message is NOT an assistant message and the user
 //      has configured a reasoning prefill below, a trailing assistant message
-//      { role: 'assistant', content: '', reasoning_content: prefill, partial: true }
-//      is appended, so no preset-side prefill prompt is needed. The `partial`
-//      flag is subject to the same rule as in step 1.
+//      { role: 'assistant', content: '', reasoning_content: prefill } is
+//      appended, so no preset-side prefill prompt is needed. The `partial`
+//      flag is applied at the end of the hook, subject to the same rule as in
+//      step 1.
 //   4. Budget re-check: the core trims the chat history to the context budget
 //      BEFORE this hook runs, so every reasoning_content we attach is added on
 //      top of an already-saturated budget. With `trim_to_budget` on, the
