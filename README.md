@@ -263,7 +263,7 @@ Two consequences, both measured on live requests.
 <details>
 <summary>How to get a request that ends with the assistant turn</summary>
 
-The nudge is only added when the core's **Continue Prefill** option is off (`openai.js:898`), and an empty nudge is not sent at all — so either enable Continue Prefill, or empty the **Continue nudge prompt** field. The extension's debug log prints the final payload, so it shows which shape you got.
+The nudge is only added when the core's **Continue Prefill** option is off, and an empty nudge is not sent at all — so either enable Continue Prefill, or empty the **Continue nudge prompt** field. The extension's debug log prints the final payload, so it shows which shape you got.
 
 | Setup | Continue nudge | Partial mode filter | Who marks the assistant turn |
 | --- | --- | --- | --- |
