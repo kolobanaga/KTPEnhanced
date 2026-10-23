@@ -32,6 +32,19 @@
                 <small>Applies only when the current model id contains one of these.</small>
             </div>
 
+            <div class="flex-container flexFlowColumn">
+                <label for="ktf_partial_filter">Partial mode filter (comma-separated substrings)</label>
+                <input id="ktf_partial_filter" class="text_pole" type="text" autocomplete="off" placeholder="kimi">
+                <small>
+                    The "partial" flag is a field of the Kimi API only. It is sent when the model id contains
+                    one of these. Officially supported by the Moonshot provider alone; on any other endpoint
+                    expect a 400, a silently ignored flag, or behaviour nobody documented. On the official
+                    Moonshot AI Chat Completion Source the core sets this flag itself when the request ends
+                    with an assistant turn.
+                    Empty filter = the mode is off.
+                </small>
+            </div>
+
             <div class="flex-container">
                 <label class="flex-container">
                     <input type="checkbox" id="ktf_force_thinking">

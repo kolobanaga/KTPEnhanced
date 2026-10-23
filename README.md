@@ -211,6 +211,71 @@ The one exception is the opt-in placeholder tool of [Multi-turn reasoning on Dee
 
 Optionally injects a `reasoning_content` prefill for the current generation. This is separate from preserved reasoning history.
 
+### Partial mode filter
+
+The Kimi API marks an unfinished assistant turn with a `partial: true` field on the message. The extension sets it on the message that carries the unfinished turn — the transformed Continue target, or the injected prefill message.
+
+**Partial mode is officially supported by the Moonshot provider only.** Everywhere else it is best-effort: expect a `400` from a strict endpoint, a flag that is silently ignored, or behaviour nobody documented. Use it at your own risk, and check whether it actually did something.
+
+The **Partial mode filter** field (comma-separated substrings, default `kimi`) lists the models whose requests may carry the flag. It is matched against the model id, so the same rule works on the official API, on OpenRouter, on a proxy and on a self-hosted server alike — name the model the way your endpoint names it.
+
+The flag is sent when the model id contains one of these entries. If the filter is not empty and the model does not match, a `partial` left in the payload by another extension is removed as well, because a strict endpoint rejects the whole request on a field it does not know. An empty filter switches the mode off completely and leaves other extensions' payloads alone.
+
+**On the official Moonshot AI Chat Completion Source the core sets the flag by itself — but only for a request that ends with an assistant turn.** SillyTavern's server marks the last message of a Moonshot-source request as `partial` whenever that message is an assistant turn. On a Continue generation the request ends with the system nudge instead, so the core marks nothing there and this filter becomes the only decider. Every other source (OpenRouter, a custom endpoint, a proxy) gets nothing from the core, and there the filter decides on its own.
+
+<details>
+<summary>Observed behaviour on live requests — measured, not documented by the providers</summary>
+
+| Endpoint | Result |
+| --- | --- |
+| Moonshot, official provider | works |
+| OpenRouter, `Moonshot AI` provider | works |
+| OpenRouter, another provider | flag ignored, no error, ordinary generation |
+| Cloudflare Workers AI, `kimi-k2.7-code` | accepted, effect undocumented |
+| Strict server (NIM), wrong model | `400 Invalid request` on the unknown field |
+
+</details>
+
+Without the flag the reasoning still travels in its own `reasoning_content` channel. What is lost is the marker that tells the Kimi API "this turn is unfinished, continue it" — the prefill is no longer continued as a partial turn.
+
+### Continue nudge and the partial mode
+
+The partial mode expects the request to **end** with the assistant turn that is to be continued. With the default core settings a Continue generation appends a system nudge after that turn (`Continue nudge prompt`, `openai.js:898`), so the request ends with the nudge instead:
+
+```json
+{ "role": "assistant", "content": "", "reasoning_content": "R9" },
+{ "role": "system", "content": "[Continue your last message without repeating its original content.]" }
+```
+
+Two consequences, both measured on live requests.
+
+**The flag is no longer on the last message.** The Kimi API documents `partial: true` on the last message of the request. With the nudge in place the flag — wherever it is set — sits on the turn before it. On the official Moonshot source the core marks the last message, which is now the nudge, so the core marks nothing at all and the extension's filter becomes the only decider.
+
+**The nudge triggers reasoning.** A model reacts to the instruction by reasoning about it, and the answer comes back with a visible trace of the model thinking about "continue without repeating" instead of continuing the turn silently. Measured on OpenRouter, the same request answered correctly in both cases — but with the nudge the reasoning was on and visible, without it the response carried no reasoning at all:
+
+```json
+// with the nudge
+{ "role": "assistant", "content": "C9", "reasoning": "The system says 'Continue your last message without repeating its original content.' …" }
+// without it
+{ "role": "assistant", "content": "C9", "reasoning": null }
+```
+
+<details>
+<summary>How to get a request that ends with the assistant turn</summary>
+
+The nudge is only added when the core's **Continue Prefill** option is off (`openai.js:898`), and an empty nudge is not sent at all — so either enable Continue Prefill, or empty the **Continue nudge prompt** field. The extension's debug log prints the final payload, so it shows which shape you got.
+
+| Setup | Continue nudge | Partial mode filter | Who marks the assistant turn |
+| --- | --- | --- | --- |
+| Official Moonshot source | off | off | the core — the request ends with that turn |
+| OpenRouter, or a custom endpoint at `api.moonshot.ai` | off | on | this extension — the request ends with that turn |
+| any source, nudge left on | on | any | this extension, but on the turn *before* the nudge — not the position the API documents |
+
+On the official source, leaving the filter off is what leaves the flag to the core. On every other source the extension has to write it, because the core writes nothing there.
+
+</details>
+
+
 ## Limitations and token budget
 
 Preserved reasoning increases prompt size. A long reasoning history can consume a significant part of the available context. The windowed strategies exist to counter this — see [Model contracts behind the strategies](#model-contracts-behind-the-strategies) for documented provider requirements and the distinction between those requirements and informal RP observations.
