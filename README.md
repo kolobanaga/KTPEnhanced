@@ -240,7 +240,7 @@ Without the flag the reasoning still travels in its own `reasoning_content` chan
 
 ### Continue nudge and the partial mode
 
-The partial mode expects the request to **end** with the assistant turn that is to be continued. With the default core settings a Continue generation appends a system nudge after that turn (`Continue nudge prompt`, `openai.js:898`), so the request ends with the nudge instead:
+The partial mode expects the request to **end** with the assistant turn that is to be continued. With the default core settings a Continue generation appends a system nudge after that turn (`Continue nudge prompt`, `public/scripts/openai.js:898`), so the request ends with the nudge instead:
 
 ```json
 { "role": "assistant", "content": "", "reasoning_content": "R9" },

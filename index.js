@@ -115,7 +115,7 @@ const GROUP_MODES = new Set(Object.values(GROUP_MODE));
 
 // `names_behavior` values of the core, which prefixes `${chat[j].name}: ` to
 // the payload content and so rewrites the text the pairing compares
-// (openai.js:586-603). Copied, not imported: the enum is internal to openai.js
+// (public/scripts/openai.js:586-603). Copied, not imported: the enum is internal to public/scripts/openai.js
 // and is not exported.
 //
 // The numbers are NOT a 0-based enumeration — NONE is -1 and DEFAULT is 0. A
@@ -169,7 +169,7 @@ const DEFAULT_REASONING_PLACEHOLDER = '[earlier thinking elided to fit the conte
 // immediate 400 on an API this hack exists to make work.
 //
 // A call is recoverable but not free: the core turns the invocation into a
-// tool_calls message plus a tool result (openai.js:3744-3745), and the
+// tool_calls message plus a tool result (public/scripts/openai.js:3744-3745), and the
 // hasTools guard then reads `m.tool_calls` / `role === 'tool'` and disables
 // this whole extension for that chat until the messages are gone.
 //
@@ -410,12 +410,12 @@ function stripPartialFlag(messages) {
  * reasoning in, i.e. the user's "Reasoning Formatting" choice.
  *
  * The core builds that wrapper itself: PromptReasoning.addToMessage() returns
- * `prefix + reasoning + suffix + separator + content` (reasoning.js:751), and
+ * `prefix + reasoning + suffix + separator + content` (public/scripts/reasoning.js:751), and
  * it is called for the trailing message with `isPrefix = true` when the
- * generation type is 'continue' (script.js:4475, 4484). So the markers in the
+ * generation type is 'continue' (public/script.js:4475, 4484). So the markers in the
  * payload are whatever the template says, and hardcoding `<think>` only ever
  * worked by coincidence: the default template is `<think>`/`</think>`
- * (power-user.js:280), which is also what DeepSeek-style templates use, while
+ * (public/scripts/power-user.js:280), which is also what DeepSeek-style templates use, while
  * every other template (OpenAI Harmony, a custom one) failed to match at all.
  *
  * Both markers are required. An empty prefix or suffix means the template
@@ -471,7 +471,7 @@ function applyThinkTransform(message) {
     // first eats a separator that begins with whitespace ('\n\n', '\n333\n')
     // and the match below then fails, leaving the separator's visible part at
     // the start of the assistant text. Nothing upstream strips it — the core
-    // only drops '\r' (openai.js:606) and Message.createAsync() stores the
+    // only drops '\r' (public/scripts/openai.js:606) and Message.createAsync() stores the
     // content as is — so the remainder here is exactly separator + content.
     if (template.separator && content.startsWith(template.separator)) {
         content = content.slice(template.separator.length);
@@ -492,14 +492,14 @@ function applyThinkTransform(message) {
  * string. Two of those rewrites are reproducible and are applied here so the
  * two sides stay comparable:
  *   - `{{macros}}`: preparePrompt() expands them for every chat message
- *     (PromptManager.js:1282-1286 via openai.js:946). substituteParams() has no
+ *     (public/scripts/PromptManager.js:1282-1286 via public/scripts/openai.js:946). substituteParams() has no
  *     fast path, so the `includes` guard keeps this free for the messages that
  *     do not use macros.
- *   - `\r`: stripped by setOpenAIMessages (openai.js:606).
+ *   - `\r`: stripped by setOpenAIMessages (public/scripts/openai.js:606).
  *
  * Not reproducible on purpose: `getRegexedString(..., { isPrompt: true })`
- * (script.js:4447) rewrites the text of prompt-affecting regex scripts, and
- * `appendFileContent` / appended titles (script.js:4448, 4461-4463) append to
+ * (public/script.js:4447) rewrites the text of prompt-affecting regex scripts, and
+ * `appendFileContent` / appended titles (public/script.js:4448, 4461-4463) append to
  * it. Their result depends on a `depth` the extension cannot reconstruct, so
  * such messages simply fail to match and keep their reasoning back — a safe
  * direction, since the alternative is reasoning attributed to the wrong turn.
@@ -525,7 +525,7 @@ function matchKey(text) {
  *
  * This is what makes a group chat pair at all. With `names_behavior` at the
  * core default (DEFAULT) every message whose speaker is not the user gets
- * `${name}: ` in front of it in the payload (openai.js:586-603), so the raw
+ * `${name}: ` in front of it in the payload (public/scripts/openai.js:586-603), so the raw
  * `mes` of a character turn never equals the payload text: nothing pairs, the
  * extension attaches no reasoning, and it does so silently. Verified on a live
  * log — `names_behavior: 0`, i.e. DEFAULT, and payload content
@@ -540,12 +540,12 @@ function matchKey(text) {
  *
  * The core's narrator exception (`extra.type === 'narrator'`) is deliberately
  * NOT mirrored: such a message is sent with role 'system'
- * (openai.js:581-583), so it is filtered out on both sides before it could
+ * (public/scripts/openai.js:581-583), so it is filtered out on both sides before it could
  * become a key. The only turns this function is ever called for are assistant
  * ones, and for those the core prefixes unconditionally.
  *
  * The prefix goes on BEFORE matchKey, not after: the core substitutes macros
- * into the already-prefixed content (openai.js:946 runs after
+ * into the already-prefixed content (public/scripts/openai.js:946 runs after
  * setOpenAIMessages), so a `{{char}}` prefix resolves on both sides alike.
  * @param {object} message Chat turn
  * @param {{namesBehavior: number, name1: string, isGroupChat: boolean}} names Core state at request time
@@ -576,7 +576,7 @@ const PAIR_TOGETHER = 3;
  * Pairs payload assistant messages with the chat turns that stored reasoning.
  *
  * The payload carries no message identifiers — by the time the request is built
- * every message has been rebuilt from role/content only (openai.js:3737-3752) —
+ * every message has been rebuilt from role/content only (public/scripts/openai.js:3737-3752) —
  * so the correspondence is recovered from the text. What the core does between
  * chat and request (insertions, dropped/edited turns, order preserved) is an
  * insertion/deletion edit, so the correspondence is an order-preserving common
@@ -737,20 +737,20 @@ function pairWithCandidates(candidates, messages) {
  *
  * Matching strategy: the payload carries no message identifiers — by the time
  * the request is built every message has been rebuilt from role/content only
- * (openai.js:3737-3752) — so the correspondence has to be recovered from the
+ * (public/scripts/openai.js:3737-3752) — so the correspondence has to be recovered from the
  * text itself, and it is recovered as the longest order-preserving pairing of
  * payload messages with chat turns that stored reasoning (see
  * pairWithCandidates).
  *
  * Three things the core does on its own still have to be mirrored:
  *   - On swipe the core drops the last chat message from the payload
- *     (script.js:4438-4440), so it is skipped here as well. On regenerate the
+ *     (public/script.js:4438-4440), so it is skipped here as well. On regenerate the
  *     core instead removes the message from the chat itself
- *     (script.js:4346-4353), which is why no pop is needed for that type.
+ *     (public/script.js:4346-4353), which is why no pop is needed for that type.
  *   - Messages flagged with the shared IGNORE_SYMBOL never reach the payload
  *     and are skipped so they cannot claim a payload message's text.
  *   - The speaker-name prefix the core puts on the payload content
- *     (openai.js:586-603), mirrored by chatTurnKey. In a group chat at the
+ *     (public/scripts/openai.js:586-603), mirrored by chatTurnKey. In a group chat at the
  *     core default `names_behavior` this is the whole ballgame: without it
  *     nothing pairs and the extension returns no reasoning at all.
  *
@@ -887,7 +887,7 @@ function attachPriorReasoning(generateData) {
         // chat data itself disagrees" — the message text and the reasoning
         // stored next to it can simply not belong to each other (they are edited
         // independently, and the core forwards extra.reasoning verbatim,
-        // openai.js:621), and then the extension faithfully sends that mismatch
+        // public/scripts/openai.js:621), and then the extension faithfully sends that mismatch
         // to the model. So the pairs themselves are logged: `candidates` is the
         // chat side as it was seen, `matched` is what each payload message ended
         // up with (real reasoning or placeholder), `unmatchedTexts` is what the
@@ -1035,7 +1035,7 @@ async function trimToBudget(generateData, protectedTarget = null) {
     //
     // The target needs its own protection *because* of the nudge: with ST's
     // default Continue behaviour the core appends the nudge system message
-    // after the assistant message being continued (openai.js:1079-1082), so the
+    // after the assistant message being continued (public/scripts/openai.js:1079-1082), so the
     // target stops being the last message — and an assistant message in that
     // position is trimmable. Dropping it would leave the request ending in a
     // nudge with no text to continue.
@@ -1161,7 +1161,7 @@ async function onChatCompletionSettingsReady(generateData) {
         //
         // On 'continue' the core does NOT leave the target as the last message:
         // it moves it into a collection that is appended last, together with a
-        // `continue_nudge_prompt` system message (openai.js:1079-1082, built at
+        // `continue_nudge_prompt` system message (public/scripts/openai.js:1079-1082, built at
         // 898-918 from the last non-injected chat message). So the payload ends
         // with [..., assistantTarget, systemNudge] and `last` is that nudge.
         // The target is therefore the last assistant message.
@@ -1170,7 +1170,7 @@ async function onChatCompletionSettingsReady(generateData) {
         // assistant message is a preset prefill and must be matched exactly, and
         // a *prior* assistant message can legitimately start with the template
         // prefix as well — with "Add reasoning to prompts" on, addToMessage()
-        // wraps those too (reasoning.js:718-720) — so scanning back for any
+        // wraps those too (public/scripts/reasoning.js:718-720) — so scanning back for any
         // generation type would let the transform rewrite a turn that has no
         // business being rewritten.
         //
